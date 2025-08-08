@@ -1,5 +1,0 @@
-%stuff = require('example.test')
-for i = 0, 10 do%\
-\
-value = "foo%$foo(i)%"
-%end%
