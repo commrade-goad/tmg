@@ -6,6 +6,7 @@
 
 struct popt *parse_args(int argc, char **argv, int min) {
     struct popt *ret = malloc(sizeof(struct popt));
+    ret->sep = '%';
 
     if (argc < min) return NULL;
     bool captured = false;
@@ -56,7 +57,6 @@ struct popt *parse_args(int argc, char **argv, int min) {
                 break;
         }
     }
-    ret->sep = '%';
     return ret;
 }
 
