@@ -1,5 +1,4 @@
-%
-should = "is it"
-seen = "yes"
-%
-something here %r(should)% not be %r(seen)%.
+% function foo(num)
+    return num + 10
+end %
+value = % $ foo(0xaa) %

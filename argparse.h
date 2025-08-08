@@ -2,7 +2,7 @@
 #define ARGPARSE_H
 
 struct popt {
-    char *in, *out, *dict;
+    char *in, *out;
     char sep;
 };
 

@@ -10,38 +10,9 @@
 #include "argparse.h"
 #include "str.h"
 
-static int print_capture(lua_State *L) {
-    // Get the number of arguments passed to the function `r`.
-    int n = lua_gettop(L);
-    luaL_Buffer b;
-
-    // Initialize a buffer to build the string.
-    luaL_buffinit(L, &b);
-
-    // Loop through all the arguments.
-    for (int i = 1; i <= n; i++) {
-        // This is the first fix:
-        // luaL_tolstring converts the argument at index `i` to a string
-        // and pushes that new string to the TOP of the stack. This is safer
-        // than luaL_checkstring as it can also convert numbers.
-        luaL_tolstring(L, i, NULL);
-
-        // luaL_addvalue takes the string from the TOP of the stack and adds
-        // it to the buffer. This now works because luaL_tolstring pushed it there.
-        luaL_addvalue(&b);
-    }
-
-    // Push the final concatenated string from the buffer onto the stack.
-    luaL_pushresult(&b);
-
-    // This is the second, crucial fix:
-    // Return 1 to tell the Lua interpreter that this C function is returning
-    // ONE value (the string we just pushed).
-    return 1;
-}
-
 int main(int argc, char **argv)
 {
+    static const char *buildins = "ret";
     const int MIN_ARGS = 3;
     struct popt *opt = parse_args(argc, argv, MIN_ARGS);
     if (!opt) return EXIT_FAILURE;
@@ -52,9 +23,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     luaL_openlibs(L);
-    lua_pushcfunction(L, print_capture);
-    lua_setglobal(L, "r");
-
+    lua_setglobal(L, buildins);
 
     FILE *in = fopen(opt->in, "r");
     if (!in) {
@@ -71,36 +40,45 @@ int main(int argc, char **argv)
 
     str_t out_builder = str_init(in_size * 2);
     str_t buffer = str_init(100);
-    
-    int old;
+
     int c;
     bool skip = false;
     while ((c = fgetc(in)) != EOF) {
-        if (c == opt->sep && old != '\\') {
+        if (c == opt->sep) {
             skip = !skip;
             if (buffer.len > 0) {
                 if (luaL_dostring(L, buffer.data) != LUA_OK) {
                     fprintf(stderr, "ERR: Lua error: %s\n", lua_tostring(L, -1));
                     lua_pop(L, 1);
                 } else {
-                    const char *result = lua_tostring(L, -1);
-                    if (result) {
-                        str_push(&out_builder, result);
-                        lua_pop(L, 1);
+                    if (lua_gettop(L) >= 1) {
+                        if (lua_isstring(L, -1)) {
+                            const char *result = lua_tostring(L, -1);
+                            str_push(&out_builder, result);
+                        }
                     }
+                    lua_settop(L, 0);
                 }
                 str_clear(&buffer);
             }
-            old = c;
             continue;
         }
-        if (!skip) str_push_chr(&out_builder, c);
-        else       str_push_chr(&buffer, c);
-        old = c;
+        if (!skip && c == '\\') {
+            str_push_chr(&out_builder, fgetc(in));
+            continue;
+        }
+        else if (skip && c == '\\') {
+            str_push_chr(&buffer, fgetc(in));
+            continue;
+        }
+        else if (!skip) str_push_chr(&out_builder, c);
+        else {
+            if (c == '$') str_push(&buffer, "return ");
+            else str_push_chr(&buffer, c);
+        }
     }
 
-    printf("%s\n", out_builder.data);
-
+    /* write to a file */
     FILE *out = fopen(opt->out, "w");
     if (!out) {
         fprintf(stderr,
@@ -112,12 +90,12 @@ int main(int argc, char **argv)
     }
     fprintf(out, "%s", out_builder.data);
 
+    /* closing */
     lua_close(L);
     cleanup_args(opt);
     str_deinit(&out_builder);
     str_deinit(&buffer);
     fclose(in);
     fclose(out);
-    // fclose(dict);
     return EXIT_SUCCESS;
 }

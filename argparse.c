@@ -33,7 +33,7 @@ struct popt *parse_args(int argc, char **argv, int min) {
                     captured = true;
                     break;
                 case 'd':
-                    ret->dict = argv[i+1];
+                    ret->sep = *argv[i+1];
                     captured = true;
                     break;
                 default:
@@ -50,7 +50,7 @@ struct popt *parse_args(int argc, char **argv, int min) {
                 ret->out = argv[i];
                 break;
             case 3:
-                ret->dict = argv[i];
+                ret->sep = *argv[i];
                 break;
             default:
                 break;
