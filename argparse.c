@@ -7,6 +7,7 @@
 struct popt *parse_args(int argc, char **argv, int min) {
     struct popt *ret = malloc(sizeof(struct popt));
     ret->sep = '%';
+    ret->print_code = false;
 
     if (argc < min) return NULL;
     bool captured = false;
@@ -19,6 +20,10 @@ struct popt *parse_args(int argc, char **argv, int min) {
 
         char *cur = argv[i];
         if (cur[0] == '-') {
+            if (cur[1] == 'p') {
+                ret->print_code = true;
+                continue;
+            }
             if (i + 1 >= argc) {
                 fprintf(stderr, "ERR: `%s` Flag need something after them.\n", cur);
                 return NULL;

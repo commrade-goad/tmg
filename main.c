@@ -130,6 +130,8 @@ int main(int argc, char **argv)
     str_push(&builder, "return table.concat(out)\n");
     /* end parsing */
 
+    if (opt->print_code) printf("%s\n", builder.data);
+
     if (luaL_dostring(L, builder.data) != LUA_OK) {
         fprintf(stderr, "ERR: Lua error: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);

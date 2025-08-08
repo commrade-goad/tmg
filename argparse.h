@@ -4,6 +4,7 @@
 struct popt {
     char *in, *out;
     char sep;
+    bool print_code;
 };
 
 struct popt *parse_args(int argc, char **argv, int min);
