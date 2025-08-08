@@ -10,10 +10,11 @@
 #include "argparse.h"
 #include "str.h"
 
+#define MIN_ARGS 3
+
 int main(int argc, char **argv)
 {
-    static const char *buildins = "ret";
-    const int MIN_ARGS = 3;
+    /* init */
     struct popt *opt = parse_args(argc, argv, MIN_ARGS);
     if (!opt) return EXIT_FAILURE;
 
@@ -23,8 +24,8 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     luaL_openlibs(L);
-    lua_setglobal(L, buildins);
 
+    /* read input file */
     FILE *in = fopen(opt->in, "r");
     if (!in) {
         fprintf(stderr,
@@ -43,6 +44,7 @@ int main(int argc, char **argv)
 
     int c;
     bool skip = false;
+    /* do the work */
     while ((c = fgetc(in)) != EOF) {
         if (c == opt->sep) {
             skip = !skip;
