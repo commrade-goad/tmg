@@ -62,9 +62,11 @@ int main(int argc, char **argv)
     while ((c = fgetc(in)) != EOF) {
         if (c == opt->sep) {
             if (inline_code) str_push(&builder, ")");
-            if (!inline_code) str_push_chr(&builder, '\n');
+            str_push_chr(&builder, '\n');
+
             inline_code = false;
             code = !code;
+
             if (buffer.len > 0) {
                 if (only_whitespace(buffer.data)) {
                     str_clear(&buffer);
@@ -96,7 +98,7 @@ int main(int argc, char **argv)
             if (c == '\\') {
                 int next = fgetc(in);
                 if (!isspace(next))
-                    str_push_chr(&builder, next);
+                    str_push_chr(&buffer, next);
                 continue;
             }
             if (isspace(c) || c == '"') {
