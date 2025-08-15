@@ -129,6 +129,13 @@ int main(int argc, char **argv)
         }
     }
 
+    if (buffer.len > 0) {
+        str_push(&builder, "out[#out+1] = \"");
+        str_push(&builder, buffer.data);
+        str_push(&builder, "\"\n");
+        str_clear(&buffer);
+    }
+
     str_push(&builder, "return table.concat(out)\n");
     /* end parsing */
 
