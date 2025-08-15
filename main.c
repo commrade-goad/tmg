@@ -141,6 +141,7 @@ int main(int argc, char **argv)
 
     if (opt->print_code) printf("%s\n", builder.data);
 
+    bool success = false;
     if (luaL_dostring(L, builder.data) != LUA_OK) {
         fprintf(stderr, "ERR: Lua error: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
@@ -149,22 +150,31 @@ int main(int argc, char **argv)
             if (lua_isstring(L, -1)) {
                 const char *result = lua_tostring(L, -1);
                 str_push(&final, result);
+                success = true;
             }
         }
         lua_settop(L, 0);
     }
 
     /* write to a file */
-    FILE *out = fopen(opt->out, "w");
-    if (!out) {
-        fprintf(stderr,
-                "ERR: Failed to create the output file `%s`: %s\n",
-                opt->out, strerror(errno)
-                );
-        lua_close(L);
-        return EXIT_FAILURE;
+    if (success) {
+        FILE *out = fopen(opt->out, "w");
+        if (!out) {
+            fprintf(stderr,
+                    "ERR: Failed to create the output file `%s`: %s\n",
+                    opt->out, strerror(errno)
+                   );
+            lua_close(L);
+            cleanup_args(opt);
+            str_deinit(&builder);
+            str_deinit(&buffer);
+            str_deinit(&final);
+            fclose(in);
+            return EXIT_FAILURE;
+        }
+        fprintf(out, "%s", final.data);
+        fclose(out);
     }
-    fprintf(out, "%s", final.data);
 
     /* closing */
     lua_close(L);
@@ -173,6 +183,5 @@ int main(int argc, char **argv)
     str_deinit(&buffer);
     str_deinit(&final);
     fclose(in);
-    fclose(out);
     return EXIT_SUCCESS;
 }
