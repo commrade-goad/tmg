@@ -1,9 +1,0 @@
-%
-local s = require('lib')
-darked_red = s.hex_to_rgb(s.num_to_hex(s.colors.red))
-darked_red.r = darked_red.r - 20
-%\
-\
-% for key, value in pairs(s.colors) do %\
-%$key% = %$s.wrap_with(s.rgb_to_hex(darked_red), '"')%
-% end %

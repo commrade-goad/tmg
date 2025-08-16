@@ -1,0 +1,108 @@
+%
+lib = require("config.wrapper")
+c = lib.colors
+
+function put(stuff)
+    return lib.num_to_hex(stuff)
+end
+%\
+* {
+    bg-col: %$put(c.bgcolor)%;
+    bg-col-light: %$put(c.bgcolor)%;
+    border-col: %$put(c.bgcolor)%;
+    selected-col: %$put(c.bgcolor)%;
+    fg-col: %$put(c.fgcolor)%;
+    grey: %$put(c.inactive)%;
+    accent-color: %$put(c.accent1)%;
+
+    width: 720;
+    font: %$lib.wrap_with(string.format("\%s \%d", c.font, 14), '"')%;
+}
+
+element-text, element-icon , mode-switcher {
+    background-color: inherit;
+    text-color:       inherit;
+}
+
+window {
+    height: 420px;
+    border: 2px;
+    border-color: @accent-color;
+    background-color: @bg-col;
+    border-radius: 0;
+    padding: 0 15;
+}
+
+mainbox {
+    background-color: @bg-col;
+}
+
+inputbar {
+    children: [prompt,entry];
+    background-color: @bg-col;
+    border-radius: 0;
+    padding: 2px;
+}
+
+prompt {
+    background-color: @accent-color;
+    padding: 6px;
+    text-color: @bg-col;
+    border-radius: 0;
+    margin: 20px 0px 0px 0px;
+}
+
+textbox-prompt-colon {
+    expand: false;
+    str: ":";
+}
+
+entry {
+    padding: 6px;
+    margin: 20px 0px 0px 10px;
+    text-color: @fg-col;
+    background-color: @bg-col;
+}
+
+listview {
+    border: 0px 0px 0px;
+    padding: 6px 0px 0px;
+    margin: 6px 0px 6px 0px;
+    columns: 1;
+    lines: 5;
+    background-color: @bg-col;
+}
+
+element {
+    padding: 8px;
+    background-color: @bg-col;
+    text-color: @fg-col  ;
+}
+
+element-icon {
+    size: 24px;
+}
+
+element selected {
+    background-color:  @accent-color ;
+    text-color: @selected-col;
+    border-radius: 0;
+}
+
+mode-switcher {
+    spacing: 0;
+}
+
+button {
+    padding: 5px;
+    background-color: @bg-col-light;
+    text-color: @grey;
+    vertical-align: 0.5; 
+    horizontal-align: 0.5;
+    border-radius: 0;
+}
+
+button selected {
+  background-color: @bg-col;
+  text-color: @accent-color;
+}

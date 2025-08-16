@@ -1,0 +1,20 @@
+return {
+	color00 = 0x201826,
+	color01 = 0x6996a6,
+	color02 = 0x698d59,
+	color03 = 0x598d83,
+	color04 = 0x8d5963,
+	color05 = 0x654369,
+	color06 = 0x8d7659,
+	color07 = 0x826e93,
+	color08 = 0x40304d,
+	color09 = 0x597f8d,
+	color10 = 0x7ca669,
+	color11 = 0x69a69a,
+	color12 = 0xa66975,
+	color13 = 0x7e5382,
+	color14 = 0xa68b69,
+	color15 = 0xd6c3e6,
+	accent1 = 0x8a69a6,
+	accent2 = 0x7e5382
+}

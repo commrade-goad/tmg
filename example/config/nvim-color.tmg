@@ -1,0 +1,34 @@
+%
+lib = require("config.wrapper")
+c = lib.colors
+
+function put(stuff)
+    return lib.wrap_with(lib.num_to_hex(stuff), '"')
+end
+%\
+\
+local custom_color = {
+    base00 = %$put(c.bgcolor)%,
+    base01 = %$put(c.t_n_black)%,
+    base02 = %$put(c.t_b_black)%,
+    base03 = %$put(c.t_b_white)%,
+
+    base04 = %$put(c.t_b_black)%,
+    base05 = %$put(c.fgcolor)%,
+    base06 = %$put(c.t_n_yellow)%,
+    base07 = %$put(c.t_cur_color)%,
+
+    base08 = %$put(c.t_n_red)%,
+    base09 = %$put(c.t_d_yellow)%,
+    base0A = %$put(c.t_n_cyan)%,
+    base0B = %$put(c.t_n_green)%,
+
+    base0C = %$put(c.t_n_blue)%,
+    base0D = %$put(c.t_n_magenta)%,
+    base0E = %$put(c.t_d_blue)%,
+    base0F = %$put(c.t_b_white)%
+}
+
+vim.api.nvim_set_hl(0, "TrailingWhitespace", { bg = %$put(c.t_d_red)% })
+
+return custom_color

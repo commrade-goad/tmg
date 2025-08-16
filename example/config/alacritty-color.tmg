@@ -1,0 +1,59 @@
+%
+lib = require("config.wrapper")
+c = lib.colors
+
+function put(stuff)
+    return lib.wrap_with(lib.num_to_hex(stuff), '"')
+end
+%\
+\
+[colors.cursor]
+cursor = %$put(c.t_cur_color)%
+text = %$put(c.bgcolor)%
+
+[colors.bright]
+black = %$put(c.t_b_black)%
+blue = %$put(c.t_b_blue)%
+cyan = %$put(c.t_b_cyan)%
+green = %$put(c.t_b_green)%
+magenta = %$put(c.t_b_magenta)%
+red = %$put(c.t_b_red)%
+white = %$put(c.t_b_white)%
+yellow = %$put(c.t_b_yellow)%
+
+[colors.dim]
+black = %$put(c.t_d_black)%
+blue = %$put(c.t_d_blue)%
+cyan = %$put(c.t_d_cyan)%
+green = %$put(c.t_d_green)%
+magenta = %$put(c.t_d_magenta)%
+red = %$put(c.t_d_red)%
+white = %$put(c.t_d_white)%
+yellow = %$put(c.t_d_yellow)%
+
+[colors.normal]
+black = %$put(c.t_n_black)%
+blue = %$put(c.t_n_blue)%
+cyan = %$put(c.t_n_cyan)%
+green = %$put(c.t_n_green)%
+magenta = %$put(c.t_n_magenta)%
+red = %$put(c.t_n_red)%
+white = %$put(c.t_n_white)%
+yellow = %$put(c.t_n_yellow)%
+
+[colors.primary]
+background = %$put(c.bgcolor)%
+dim_foreground = %$put(c.t_fgcolor_dim)%
+foreground = %$put(c.t_fgcolor)%
+
+[colors.search.matches]
+background = %$put(c.t_n_cyan)%
+foreground = "CellBackground"
+
+[colors.selection]
+background = %$put(c.t_select_color)%
+text = "CellForeground"
+
+[colors.vi_mode_cursor]
+cursor = %$put(c.t_cur_color)%
+text = %$put(c.bgcolor)%

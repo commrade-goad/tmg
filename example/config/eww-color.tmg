@@ -1,0 +1,196 @@
+%
+lib = require("config.wrapper")
+c = lib.colors
+
+function put(stuff)
+    return lib.num_to_hex(stuff)
+end
+%\
+\
+$foreground: %$put(c.fgcolor)%;
+$background: %$put(c.bgcolor)%;
+
+// Regular colors
+$regular0: %$put(c.t_n_black)%;
+$regular1: %$put(c.t_n_red)%;
+$regular2: %$put(c.t_n_green)%;
+$regular3: %$put(c.t_n_yellow)%;
+$regular4: %$put(c.t_n_blue)%;
+$regular5: %$put(c.t_n_magenta)%;
+$regular6: %$put(c.t_n_cyan)%;
+$regular7: %$put(c.t_n_white)%;
+
+// Bright colors
+$bright0: %$put(c.t_b_black)%;
+$bright1: %$put(c.t_b_red)%;
+$bright2: %$put(c.t_b_green)%;
+$bright3: %$put(c.t_b_yellow)%;
+$bright4: %$put(c.t_b_blue)%;
+$bright5: %$put(c.t_b_magenta)%;
+$bright6: %$put(c.t_b_cyan)%;
+$bright7: %$put(c.t_b_white)%;
+
+// Dim colors
+$dim0: %$put(c.t_d_black)%;
+$dim1: %$put(c.t_d_red)%;
+$dim2: %$put(c.t_d_green)%;
+$dim3: %$put(c.t_d_yellow)%;
+$dim4: %$put(c.t_d_blue)%;
+$dim5: %$put(c.t_d_magenta)%;
+$dim6: %$put(c.t_d_cyan)%;
+$dim7: %$put(c.t_d_white)%;
+
+$accent: %$put(c.accent1)%;
+
+$bar-bg: %$put(c.bgcolor)%;
+$text-color: %$put(c.fgcolor)%;
+$hover-color: %$put(c.accent2)%;
+
+* {
+  all: unset;
+}
+
+.bar {
+  font-family: "IosevkaTerm Nerd Font, Noto Sans CJK HK";
+  font-size: 15px;
+  background-color: $bar-bg;
+  color: $text-color;
+  color: $accent;
+}
+
+.sidestuff {
+  slider {
+    color: $accent;
+  }
+}
+
+.workspace-button {
+  padding-bottom: 8px;
+  padding-top: 8px;
+}
+
+.workspace-button.active {
+  color: $foreground;
+  font-weight: bold;
+}
+
+.separator {
+  color: $dim0
+}
+
+.battery_inner  {
+  font-weight: bold;
+  margin-bottom: 4px;
+  margin-top: 4px;
+}
+
+.battery:hover {
+  color: $foreground;
+}
+
+.time_inner {
+  font-weight: bold;
+  margin-top: 4px;
+  margin-bottom: 8px;
+}
+
+.time:hover {
+  color: $foreground;
+}
+
+.music_inner {
+  font-weight: bold;
+  margin-top: 6px;
+  margin-bottom: 4px;
+}
+
+.music:hover {
+  color: $foreground;
+}
+
+menu {
+  all: unset;
+  padding: 5px;
+  background-color: $background;
+  color: $foreground;
+  border: 1px solid $accent;
+
+  menuitem {
+    border-radius: 5px;
+    padding: 8px 12px;
+    background-color: transparent;
+    transition: all .2s ease;
+
+    &:backdrop {
+      background-color: $background;
+    }
+  }
+
+  menuitem arrow {
+    min-width: 16px;
+    min-height: 16px;
+
+    &:dir(ltr) {
+      -gtk-icon-source: -gtk-icontheme('pan-end-symbolic');
+      margin-left: 10px;
+      margin-right: 0;
+    }
+  }
+
+  menuitem:hover {
+    background-color: $accent;
+    color: $background;
+    border-radius: 0;
+  }
+}
+
+tooltip {
+  background-color: $background;
+  border: 1px solid $accent;
+  color: $foreground;
+  min-width: 16px;
+  min-height: 16px;
+  padding: 8px;
+  font-weight: normal;
+}
+
+.cal-box {
+  all: unset;
+  background-color: $background;
+  border: 1px solid $accent;
+  font-weight: bold;
+  .cal-inner-box {
+    padding: 1rem 1rem .2rem;
+
+    .cal {
+      &.highlight {
+        padding: 10rem;
+      }
+
+      padding: .8rem .25rem 0rem;
+      margin-left: 10px;
+    }
+  }
+}
+
+calendar:selected {
+  color: $accent;
+}
+
+calendar.header {
+  color: $accent;
+  font-weight: bold;
+}
+
+calendar.button {
+  color: $regular4;
+}
+calendar.highlight {
+  color: $regular4;
+  font-weight: bold;
+}
+
+calendar:indeterminate {
+  color: $background;
+}
+

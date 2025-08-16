@@ -1,0 +1,19 @@
+%
+lib = require("config.wrapper")
+c = lib.colors
+
+function put(stuff)
+    nth = lib.num_to_hex(stuff)
+    return lib.strip_prefix(nth)
+end
+%\
+\
+$accent_color = %$put(c.accent1)%
+$accent_color_two = %$put(c.accent2)%
+$accent_color_deg = %$c.gradrotation%
+$grayed_out = %$put(c.inactive)%
+$rounded_corner = %$c.round%
+$use_font = %$c.font%
+$fg_color = %$put(c.fgcolor)%
+$black_color = %$put(c.bgcolor)% 
+$red_color = %$put(c.t_n_red)%

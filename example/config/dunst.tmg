@@ -1,0 +1,110 @@
+%
+lib = require("config.wrapper")
+c = lib.colors
+
+function put(stuff)
+    return lib.wrap_with(lib.num_to_hex(stuff), '"')
+end
+%\
+\
+[global]
+    monitor = 0
+    follow = mouse
+
+    width = (100, 320)
+    height = (0,300)
+    origin = top-left
+
+    offset = 10x10
+    scale = 0
+
+    notification_limit = 4
+
+    progress_bar = true
+    progress_bar_height = 10
+    progress_bar_frame_width = 1
+    progress_bar_min_width = 150
+    progress_bar_max_width = 320
+
+    highlight = %$put(c.accent1)%
+
+    indicate_hidden = yes
+
+    separator_height = 2
+    padding = 8
+    horizontal_padding = 8
+    text_icon_padding = 0
+    frame_width = 2
+
+    frame_color = %$put(c.accent1)%
+    separator_color = frame
+    sort = yes
+
+    font = %$c.font% 12
+    line_height = 0
+
+    markup = full
+    format = "<b>\%s</b>\\\\n\%b"
+
+    alignment = left
+    vertical_alignment = center
+
+    show_age_threshold = 60
+
+    ellipsize = middle
+    ignore_newline = no
+    stack_duplicates = true
+    hide_duplicate_count = false
+
+    # Display indicators for URLs (U) and actions (A).
+    show_indicators = no
+    icon_position = right
+    min_icon_size = 0
+    max_icon_size = 32
+
+    icon_path = /usr/share/icons/gnome/16x16/status/:/usr/share/icons/gnome/16x16/devices/
+
+    sticky_history = yes
+    history_length = 20
+
+    dmenu = /usr/bin/rofi --dmenu -p dunst:
+    browser = /usr/bin/xdg-open
+    always_run_script = true
+    title = Dunst
+    class = Dunst
+
+    corner_radius = 0
+
+    ignore_dbusclose = false
+    force_xwayland = false
+    force_xinerama = false
+
+    mouse_left_click = do_action
+    mouse_middle_click = close_all, close_current
+    mouse_right_click = close_current
+
+[experimental]
+    per_monitor_dpi = false
+
+[urgency_low]
+    background = %$put(c.bgcolor)%
+    foreground = %$put(c.fgcolor)%
+    timeout = 10
+
+[urgency_normal]
+    background = %$put(c.bgcolor)%
+    foreground = %$put(c.fgcolor)%
+    timeout = 10
+
+[urgency_critical]
+    background = %$put(c.bgcolor)%
+    foreground = %$put(c.t_n_red)%
+    frame_color = %$put(c.t_n_red)%
+    highlight = %$put(c.t_n_red)%
+    timeout = 0
+
+[history-ignore]
+    appname = "ignore"
+    history_ignore = yes
+
+# vim: ft=cfg

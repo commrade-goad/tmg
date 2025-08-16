@@ -2,7 +2,7 @@ local M = {}
 
 package.path = package.path .. ';./?.lua'
 
-M.colors = require('color-table')
+M.colors = require('custom')
 
 --- Convert a number to a hex string in #RRGGBB format
 function M.num_to_hex(num)
