@@ -51,6 +51,9 @@ int main(int argc, char **argv)
     str_t builder = str_init(in_size * 2);
     str_t buffer = str_init(100);
     str_t final =  str_init(in_size * 2);
+    builder.data[0] = '\0';
+    buffer.data[0] = '\0';
+    final.data[0] = '\0';
 
     /* start parsing */
     str_push(&builder, "local out = {}\n");
