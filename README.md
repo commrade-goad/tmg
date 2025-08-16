@@ -1,6 +1,9 @@
 # TMG
 a simple template engine that integrate with `lua` so you can script your template.
 
+## Integration
+Generate base16 colors using wallpaper with [tmg-wall](https://github.com/commrade-goad/tmg-wall).
+
 ## Build
 1. __Dependency:__
     * `lua`
@@ -8,7 +11,7 @@ a simple template engine that integrate with `lua` so you can script your templa
 2. __Build:__
 
 ```sh
-make all -j8
+make all -j$(nproc)
 ```
 
 ## Usage
