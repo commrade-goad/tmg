@@ -26,6 +26,7 @@ int main(int argc, char **argv)
     /* init */
     struct popt *opt = parse_args(argc, argv, MIN_ARGS);
     if (!opt) return EXIT_FAILURE;
+    if (opt->exit) return 1;
 
     lua_State *L = luaL_newstate();
     if (L == NULL) {
