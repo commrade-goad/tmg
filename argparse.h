@@ -4,13 +4,11 @@
 #include <stdbool.h>
 
 struct popt {
-    char *in, *out;
-    char sep;
-    bool print_code;
+    char *script;
     bool exit;
 };
 
-struct popt *parse_args(int argc, char **argv, int min);
+struct popt *parse_args(int argc, char **argv);
 void cleanup_args(struct popt *opt);
 
 #endif /* ARGPARSE_H */
