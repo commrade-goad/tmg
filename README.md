@@ -35,11 +35,11 @@ local ok = tmg.render("in.tmg", "out.conf")
 tmg.render("in.tmg", "out.conf", "#")
 
 -- or set it for every render() call in this script:
-G_delim = "#"
+tmg_delim = "#"
 
 -- print each generated Lua chunk to stderr before running it, useful when
 -- debugging a template:
-G_debug = true
+tmg_debug = true
 ```
 
 Inside a `.tmg` file, the delimiter char toggles between plain text and

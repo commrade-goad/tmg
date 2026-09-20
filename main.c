@@ -52,11 +52,11 @@ static bool only_whitespace(char *str) {
 }
 
 /* ---- error reporting ----------------------------------------------------
- * Lua error messages look like "<chunkname>:<gen_line>: <msg>". gen_line
- * refers to the synthesized chunk we built, not the user's .tmg file, so we
- * rewrite it using the line map before printing. Best-effort: several
- * source lines collapsing onto one generated line will point at the first
- * of them. */
+* Lua error messages look like "<chunkname>:<gen_line>: <msg>". gen_line
+* refers to the synthesized chunk we built, not the user's .tmg file, so we
+* rewrite it using the line map before printing. Best-effort: several
+* source lines collapsing onto one generated line will point at the first
+* of them. */
 static int msghandler(lua_State *L) {
     const char *msg = lua_tostring(L, -1);
     if (msg == NULL) {
@@ -84,7 +84,7 @@ static void report_error(const char *msg, const char *in_path, linemap_t *lm) {
             if (gen_line > 0 && (size_t)gen_line <= lm->len)
                 orig_line = lm->data[gen_line - 1];
             if (*rest == ':') rest++;
-            fprintf(stderr, "ERR: %s:%d:%s\n", in_path, orig_line, rest);
+                fprintf(stderr, "ERR: %s:%d:%s\n", in_path, orig_line, rest);
             return;
         }
     }
@@ -92,16 +92,16 @@ static void report_error(const char *msg, const char *in_path, linemap_t *lm) {
 }
 
 /* ---- core expand ----------------------------------------------------------
- * Parses `in_path` as a .tmg template, builds a synthetic Lua chunk, and
- * runs it in the caller's lua_State L (so it sees whatever the build script
- * already `require`d / set up). On success leaves the rendered string on
- * top of the Lua stack and returns true. On failure the stack is left as it
- * was, an error is reported to stderr, and false is returned. This is the
- * shared core behind both tmg_render (writes to a file) and
- * tmg_render_string (hands the string back to the caller); it never touches
- * Lua's stdout/stderr itself, so a build script's own logging can never
- * collide with template output. */
-static bool tmg_expand(lua_State *L, const char *in_path, char sep, bool debug)
+* Parses `in_path` as a .tmg template, builds a synthetic Lua chunk, and
+* runs it in the caller's lua_State L (so it sees whatever the build script
+* already `require`d / set up). On success leaves the rendered string on
+* top of the Lua stack and returns true. On failure the stack is left as it
+* was, an error is reported to stderr, and false is returned. This is the
+* shared core behind both tmg_render (writes to a file) and
+* tmg_render_string (hands the string back to the caller); it never touches
+* Lua's stdout/stderr itself, so a build script's own logging can never
+* collide with template output. */
+static bool tmg_expand(lua_State *L, const char *in_path, char *sep, bool debug)
 {
     FILE *in = fopen(in_path, "r");
     if (!in) {
@@ -113,11 +113,13 @@ static bool tmg_expand(lua_State *L, const char *in_path, char sep, bool debug)
     long in_size = ftell(in);
     rewind(in);
 
-    str_t builder = str_init(in_size * 2);
-    str_t buffer  = str_init(100);
-    linemap_t lm  = linemap_init();
-    int gen_line  = 1;
-    int cur_line  = 1;
+    size_t sepsize = strlen(sep);
+    str_t match_buf = str_init(sepsize + 1);
+    str_t builder   = str_init(in_size * 2);
+    str_t buffer    = str_init(100);
+    linemap_t lm    = linemap_init();
+    int gen_line    = 1;
+    int cur_line    = 1;
     linemap_push(&lm, cur_line); /* gen line 1 -> orig line 1 */
 
     str_push(&builder, "local out = {}\n");
@@ -125,85 +127,110 @@ static bool tmg_expand(lua_State *L, const char *in_path, char sep, bool debug)
 
     bool code = false;
     bool inline_code = false;
+    bool escape_next = false;
     int c;
+
+    /* Helper lambda/block logic for pushing escaped text to buffer */
+    #define PUSH_TEXT_CHAR(ch) do { \
+        switch (ch) { \
+            case '\\': str_push(&buffer, "\\\\"); break; \
+            case '\n': str_push(&buffer, "\\n");  break; \
+            case '\r': str_push(&buffer, "\\r");  break; \
+            case '\t': str_push(&buffer, "\\t");  break; \
+            case '"':  str_push(&buffer, "\\\""); break; \
+            default:   str_push_chr(&buffer, ch); break; \
+        } \
+    } while(0)
+
     while ((c = fgetc(in)) != EOF) {
         if (c == '\n') cur_line++;
 
-        if (c == sep) {
-            if (inline_code) str_push(&builder, ")");
-            str_push_chr(&builder, '\n');
-            note_newline(&lm, &gen_line, cur_line);
+        /* Handle escape sequence (\) directly */
+        if (escape_next) {
+            escape_next = false;
+            if (c == '\n') {
+                /* Keep line map synced on line continuation */
+                note_newline(&lm, &gen_line, cur_line);
+                str_push_chr(&builder, '\n');
+                continue;
+            }
+            if (code) {
+                str_push_chr(&builder, (char)c);
+            } else {
+                PUSH_TEXT_CHAR((char)c);
+            }
+            continue;
+        }
 
-            inline_code = false;
-            code = !code;
+        if (c == '\\') {
+            escape_next = true;
+            continue;
+        }
 
-            if (buffer.len > 0) {
-                if (only_whitespace(buffer.data)) {
-                    str_clear(&buffer);
+        /* Buffer potential delimiter match */
+        str_push_chr(&match_buf, (char)c);
+
+        if (match_buf.len <= sepsize && strncmp(match_buf.data, sep, match_buf.len) == 0) {
+            /* Full delimiter matched */
+            if (match_buf.len == sepsize) {
+                if (inline_code) {
+                    str_push(&builder, ")");
+                    inline_code = false;
+                }
+                str_push_chr(&builder, '\n');
+                note_newline(&lm, &gen_line, cur_line);
+
+                code = !code;
+
+                if (buffer.len > 0) {
+                    if (only_whitespace(buffer.data)) {
+                        str_clear(&buffer);
+                    } else {
+                        str_push(&builder, "out[#out+1] = \"");
+                        str_push(&builder, buffer.data);
+                        str_push(&builder, "\"\n");
+                        note_newline(&lm, &gen_line, cur_line);
+                        str_clear(&buffer);
+                    }
+                }
+                str_clear(&match_buf);
+            }
+            continue;
+        }
+
+        /* Match failed: Flush match_buf byte-by-byte safely */
+        for (size_t i = 0; i < match_buf.len; i++) {
+            char ch = match_buf.data[i];
+            if (code) {
+                if (ch == '$') {
+                    inline_code = true;
+                    str_push(&builder, "out[#out+1] = tostring(");
                     continue;
                 }
-                str_push(&builder, "out[#out+1] = \"");
-                str_push(&builder, buffer.data);
-                str_push(&builder, "\"\n");
-                note_newline(&lm, &gen_line, cur_line);
-                str_clear(&buffer);
+                str_push_chr(&builder, ch);
+                if (ch == '\n') note_newline(&lm, &gen_line, cur_line);
+            } else {
+                PUSH_TEXT_CHAR(ch);
             }
-            continue;
         }
-        if (code) {
-            if (c == '\\') {
-                int next = fgetc(in);
-                if (next == '\n') cur_line++;
-                if (!isspace(next))
-                    str_push_chr(&builder, next);
-                continue;
-            }
-            if (c == '$') {
-                inline_code = true;
-                c = fgetc(in);
-                if (c == '\n') cur_line++;
-                str_push(&builder, "out[#out+1] = ");
-                str_push(&builder, "tostring(");
-            }
-            str_push_chr(&builder, c);
-            if (c == '\n') note_newline(&lm, &gen_line, cur_line);
-            continue;
-        } else {
-            if (c == '\\') {
-                int next = fgetc(in);
-                if (next == '\n') cur_line++;
-                if (!isspace(next))
-                    str_push_chr(&buffer, next);
-                continue;
-            }
-            if (isspace(c) || c == '"') {
-                switch (c) {
-                    case '\n':
-                        str_push_chr(&buffer, '\\');
-                        str_push_chr(&buffer, 'n');
-                        break;
-                    case '\r':
-                        str_push_chr(&buffer, '\\');
-                        str_push_chr(&buffer, 'r');
-                        break;
-                    case '\t':
-                        str_push_chr(&buffer, '\\');
-                        str_push_chr(&buffer, 't');
-                        break;
-                    case '"':
-                        str_push_chr(&buffer, '\\');
-                        str_push_chr(&buffer, '"');
-                        break;
-                    default:
-                        str_push_chr(&buffer, c);
-                        break;
-                }
-                continue;
-            }
-            str_push_chr(&buffer, c);
-        }
+        str_clear(&match_buf);
     }
     fclose(in);
+
+    /* Flush leftover buffer if file ends with trailing backslash or partial match */
+    if (escape_next) {
+        if (code) str_push_chr(&builder, '\\');
+        else PUSH_TEXT_CHAR('\\');
+    }
+
+    if (match_buf.len > 0) {
+        for (size_t i = 0; i < match_buf.len; i++) {
+            char ch = match_buf.data[i];
+            if (code) str_push_chr(&builder, ch);
+            else PUSH_TEXT_CHAR(ch);
+        }
+        str_clear(&match_buf);
+    }
 
     if (buffer.len > 0) {
         str_push(&builder, "out[#out+1] = \"");
@@ -215,7 +242,6 @@ static bool tmg_expand(lua_State *L, const char *in_path, char sep, bool debug)
 
     str_push(&builder, "return table.concat(out)\n");
     note_newline(&lm, &gen_line, cur_line);
-    /* end parsing */
 
     if (debug) {
         fprintf(stderr, "-- generated chunk for %s --\n%s-- end --\n",
@@ -237,7 +263,6 @@ static bool tmg_expand(lua_State *L, const char *in_path, char sep, bool debug)
         report_error(lua_tostring(L, -1), in_path, &lm);
         lua_pop(L, 1);
     } else if (lua_isstring(L, -1)) {
-        /* leave the result string on the stack for the caller */
         success = true;
     } else {
         fprintf(stderr, "ERR: %s: template did not produce a string result\n", in_path);
@@ -247,14 +272,18 @@ static bool tmg_expand(lua_State *L, const char *in_path, char sep, bool debug)
 
     str_deinit(&builder);
     str_deinit(&buffer);
+    str_deinit(&match_buf);
     linemap_deinit(&lm);
-    return success; /* stack top = result string iff true */
+
+    return success;
+
+    #undef PUSH_TEXT_CHAR
 }
 
 /* Parses+runs the template and writes the rendered result to out_path via C
- * stdio directly (never through Lua's io library). */
+* stdio directly (never through Lua's io library). */
 bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
-                 char sep, bool debug)
+char *sep, bool debug)
 {
     if (!tmg_expand(L, in_path, sep, debug)) return false;
 
@@ -263,7 +292,7 @@ bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
     FILE *out = fopen(out_path, "w");
     if (!out) {
         fprintf(stderr, "ERR: Failed to create the output file `%s`: %s\n",
-                out_path, strerror(errno));
+        out_path, strerror(errno));
     } else {
         fputs(result, out);
         fclose(out);
@@ -274,9 +303,9 @@ bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
 }
 
 /* Parses+runs the template and hands the rendered string back to Lua
- * instead of writing it anywhere. Writing (if any) is then the calling
- * Lua code's responsibility, via normal Lua io. */
-bool tmg_render_string(lua_State *L, const char *in_path, char sep, bool debug)
+* instead of writing it anywhere. Writing (if any) is then the calling
+* Lua code's responsibility, via normal Lua io. */
+bool tmg_render_string(lua_State *L, const char *in_path, char *sep, bool debug)
 {
     /* leaves result string on stack on success, matching tmg_expand */
     return tmg_expand(L, in_path, sep, debug);
@@ -284,16 +313,16 @@ bool tmg_render_string(lua_State *L, const char *in_path, char sep, bool debug)
 
 /* ---- Lua-facing glue ------------------------------------------------- */
 
-static char resolve_sep(lua_State *L, int idx) {
-    char sep = '%';
+static char *resolve_sep(lua_State *L, int idx) {
+    char *sep = "%";
     if (!lua_isnoneornil(L, idx)) {
         const char *s = luaL_checkstring(L, idx);
-        if (s[0]) sep = s[0];
+        if (s) sep = s;
     } else {
         lua_getglobal(L, "tmg_delim");
         if (lua_isstring(L, -1)) {
             const char *s = lua_tostring(L, -1);
-            if (s && s[0]) sep = s[0];
+            if (s) sep = s;
         }
         lua_pop(L, 1);
     }
@@ -311,7 +340,7 @@ static bool resolve_debug(lua_State *L) {
 static int l_tmg_render(lua_State *L) {
     const char *in_path  = luaL_checkstring(L, 1);
     const char *out_path = luaL_checkstring(L, 2);
-    char sep = resolve_sep(L, 3);
+    char *sep = resolve_sep(L, 3);
     bool debug = resolve_debug(L);
 
     bool ok = tmg_render(L, in_path, out_path, sep, debug);
@@ -320,12 +349,12 @@ static int l_tmg_render(lua_State *L) {
 }
 
 /* tmg.render_string(in_path [, sep]) -> string | nil
- * Same parsing/execution as tmg.render, but returns the rendered text
- * instead of writing it to a file. Writing it (or not) is on the Lua side
- * from here on: `local f = io.open(path, "w"); f:write(result); f:close()`. */
+* Same parsing/execution as tmg.render, but returns the rendered text
+* instead of writing it to a file. Writing it (or not) is on the Lua side
+* from here on: `local f = io.open(path, "w"); f:write(result); f:close()`. */
 static int l_tmg_render_string(lua_State *L) {
     const char *in_path = luaL_checkstring(L, 1);
-    char sep = resolve_sep(L, 2);
+    char *sep = resolve_sep(L, 2);
     bool debug = resolve_debug(L);
 
     if (tmg_render_string(L, in_path, sep, debug)) {
@@ -347,9 +376,9 @@ int luaopen_tmg(lua_State *L) {
 }
 
 /* ---- entrypoint --------------------------------------------------------
- * tmg is a Lua runtime with templating built in: it does not render
- * anything by itself. Point it at a build script; the script calls
- * tmg.render(in, out) for every template it wants written. */
+* tmg is a Lua runtime with templating built in: it does not render
+* anything by itself. Point it at a build script; the script calls
+* tmg.render(in, out) for every template it wants written. */
 int main(int argc, char **argv)
 {
     struct popt *opt = parse_args(argc, argv);
