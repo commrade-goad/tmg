@@ -291,7 +291,8 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
 /* Parses+runs the template and writes the rendered result to out_path via C
 * stdio directly (never through Lua's io library). */
 bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
-const char *sep, bool debug)
+                const char *sep, bool debug)
+
 {
     if (!tmg_expand(L, in_path, sep, debug)) return false;
 
