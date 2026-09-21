@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdbool.h>
 
 static inline void print_version(const char *name) {
@@ -10,77 +11,35 @@ static inline void print_version(const char *name) {
 }
 
 static inline void print_help(const char *name) {
-    printf("%s -i [input] -o [output] <flags>\n", name);
-    printf("<flags> :\n");
-    printf("  -i [f] : input file\n");
-    printf("  -o [f] : output file\n");
-    printf("  -d [c] : set the delimiter char (default `%%`).\n");
-    printf("  -p     : print the generated code to stdout.\n");
+    printf("%s <script.lua>\n", name);
+    printf("  -h : print this help\n");
+    printf("  -v : print version\n\n");
+    printf("tmg is a Lua runtime with templating built in. Write a build\n");
+    printf("script that calls tmg.render(input, output [, delim]) to render\n");
+    printf("`.tmg` templates. Set a global tmg_delim before calling render to\n");
+    printf("change the default delimiter (`%%`), or tmg_debug = true to print\n");
+    printf("generated chunks to stderr.\n");
 }
 
-struct popt *parse_args(int argc, char **argv, int min) {
+struct popt *parse_args(int argc, char **argv) {
     struct popt *ret = malloc(sizeof(struct popt));
-    ret->sep = '%';
-    ret->print_code = false;
+    ret->script = NULL;
     ret->exit = false;
 
-    // if (argc < min) return NULL;
-    bool captured = false;
-
     for (int i = 1; i < argc; i++) {
-        if (captured) {
-            captured = false;
-            continue;
-        }
-
         char *cur = argv[i];
-        if (cur[0] == '-') {
-            if (cur[1] == 'p') {
-                ret->print_code = true;
-                continue;
-            }
-            if (cur[1] == 'h' || cur[i] == 'v') {
-                if (cur[1] == 'v') print_version(argv[0]);
-                if (cur[1] == 'h') print_help(argv[0]);
-                ret->exit = true;
-                break;
-            }
-            if (i + 1 >= argc) {
-                fprintf(stderr, "ERR: `%s` Flag need something after them.\n", cur);
-                return NULL;
-            }
-
-            switch (cur[1]) {
-                case 'i':
-                    ret->in = argv[i+1];
-                    captured = true;
-                    break;
-                case 'o':
-                    ret->out = argv[i+1];
-                    captured = true;
-                    break;
-                case 'd':
-                    ret->sep = *argv[i+1];
-                    captured = true;
-                    break;
-                default:
-                    fprintf(stderr, "ERR: Invalid flag `%c`.\n", argv[i][1]);
-                    return NULL;
-            }
-            continue;
+        if (strcmp(cur, "-h") == 0) {
+            print_help(argv[0]);
+            ret->exit = true;
+            return ret;
         }
-        switch (i) {
-            case 1:
-                ret->in = argv[i];
-                break;
-            case 2:
-                ret->out = argv[i];
-                break;
-            case 3:
-                ret->sep = *argv[i];
-                break;
-            default:
-                break;
+        if (strcmp(cur, "-v") == 0) {
+            print_version(argv[0]);
+            ret->exit = true;
+            return ret;
+        }
+        if (!ret->script) {
+            ret->script = cur;
         }
     }
     return ret;

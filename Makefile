@@ -1,6 +1,6 @@
 CC     = gcc
 CFLAGS = -Wall -Wextra -pedantic -O2
-LIBS   = -L./lua-5.4.8/src/ -lm -l:liblua.a -I./lua-5.4.8/src/
+LIBS   = -L./lua-5.4.8/src/ -l:liblua.a -lm -I./lua-5.4.8/src/
 
 SRC = $(wildcard *.c)
 OBJ = $(SRC:.c=.o)
