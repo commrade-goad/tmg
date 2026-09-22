@@ -113,6 +113,69 @@ static void report_error(const char *msg, const char *in_path, linemap_t *lm) {
     fprintf(stderr, "ERR: %s\n", msg);
 }
 
+static void report_error_with_code(const char *msg, const char *in_path,
+                                  const linemap_t *lm, const char *gen_code)
+{
+    if (!msg) msg = "(unknown error)";
+
+    char prefix[1024];
+    snprintf(prefix, sizeof(prefix), "%s:", in_path);
+    const char *p = strstr(msg, prefix);
+
+    int gen_line = -1;
+    int orig_line = -1;
+    const char *err_detail = msg;
+
+    if (p) {
+        p += strlen(prefix);
+        char *rest = NULL;
+        long parsed_line = strtol(p, &rest, 10);
+        if (rest != p) {
+            gen_line = (int)parsed_line;
+            if (gen_line > 0 && (size_t)gen_line <= lm->len) {
+                orig_line = lm->data[gen_line - 1];
+            } else {
+                orig_line = gen_line;
+            }
+            if (*rest == ':') rest++;
+            err_detail = rest;
+        }
+    }
+
+    /* Print main error header */
+    if (gen_line != -1) {
+        fprintf(stderr, "ERR: %s:%d:%s\n\n", in_path, orig_line, err_detail);
+    } else {
+        fprintf(stderr, "ERR: %s\n\n", msg);
+    }
+
+    /* Print context snippet from generated code if available */
+    if (gen_line > 0 && gen_code) {
+        fprintf(stderr, "--- Generated Code Context ---\n");
+
+        int current_line = 1;
+        const char *line_start = gen_code;
+        const char *ptr = gen_code;
+
+        while (*ptr != '\0') {
+            if (*ptr == '\n' || *(ptr + 1) == '\0') {
+                size_t line_len = ptr - line_start + (*ptr == '\n' ? 0 : 1);
+
+                /* Print 3 lines before and 3 lines after the error */
+                if (current_line >= gen_line - 3 && current_line <= gen_line + 3) {
+                    char marker = (current_line == gen_line) ? '>' : ' ';
+                    fprintf(stderr, "%c %4d | %.*s\n", marker, current_line, (int)line_len, line_start);
+                }
+
+                line_start = ptr + 1;
+                current_line++;
+            }
+            ptr++;
+        }
+        fprintf(stderr, "------------------------------\n");
+    }
+}
+
 /* ---- core expand ----------------------------------------------------------
 * Parses `in_path` as a .tmg template, builds a synthetic Lua chunk, and
 * runs it in the caller's lua_State L (so it sees whatever the build script
@@ -289,10 +352,10 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
     snprintf(chunkname, sizeof(chunkname), "@%s", in_path);
 
     if (luaL_loadbuffer(L, builder.data, builder.len, chunkname) != LUA_OK) {
-        report_error(lua_tostring(L, -1), in_path, &lm);
+        report_error_with_code(lua_tostring(L, -1), in_path, &lm, builder.data);
         lua_pop(L, 1);
     } else if (lua_pcall(L, 0, 1, msgh_idx) != LUA_OK) {
-        report_error(lua_tostring(L, -1), in_path, &lm);
+        report_error_with_code(lua_tostring(L, -1), in_path, &lm, builder.data);
         lua_pop(L, 1);
     } else if (lua_isstring(L, -1)) {
         success = true;
