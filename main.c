@@ -65,20 +65,8 @@ static void note_newline(linemap_t *lm, int *gen_line, int orig_line) {
     linemap_push(lm, orig_line);
 }
 
-static bool only_whitespace(char *str) {
-    char *ptr = str;
-    while (ptr && *ptr != '\0') {
-        if (!isspace((unsigned char)*ptr++)) return false;
-    }
-    return true;
-}
+/* ---- error reporting ---------------------------------------------------- */
 
-/* ---- error reporting ----------------------------------------------------
-* Lua error messages look like "<chunkname>:<gen_line>: <msg>". gen_line
-* refers to the synthesized chunk we built, not the user's .tmg file, so we
-* rewrite it using the line map before printing. Best-effort: several
-* source lines collapsing onto one generated line will point at the first
-* of them. */
 static int msghandler(lua_State *L) {
     const char *msg = lua_tostring(L, -1);
     if (msg == NULL) {
@@ -90,31 +78,8 @@ static int msghandler(lua_State *L) {
     return 1;
 }
 
-static void report_error(const char *msg, const char *in_path, linemap_t *lm) {
-    if (!msg) msg = "(unknown error)";
-
-    char prefix[1024];
-    snprintf(prefix, sizeof(prefix), "%s:", in_path);
-    const char *p = strstr(msg, prefix);
-
-    if (p) {
-        p += strlen(prefix);
-        char *rest = NULL;
-        long gen_line = strtol(p, &rest, 10);
-        if (rest != p) {
-            int orig_line = (int)gen_line;
-            if (gen_line > 0 && (size_t)gen_line <= lm->len)
-                orig_line = lm->data[gen_line - 1];
-            if (*rest == ':') rest++;
-                fprintf(stderr, "ERR: %s:%d:%s\n", in_path, orig_line, rest);
-            return;
-        }
-    }
-    fprintf(stderr, "ERR: %s\n", msg);
-}
-
 static void report_error_with_code(const char *msg, const char *in_path,
-                                  const linemap_t *lm, const char *gen_code)
+                                   const linemap_t *lm, const char *gen_code)
 {
     if (!msg) msg = "(unknown error)";
 
@@ -161,7 +126,6 @@ static void report_error_with_code(const char *msg, const char *in_path,
             if (*ptr == '\n' || *(ptr + 1) == '\0') {
                 size_t line_len = ptr - line_start + (*ptr == '\n' ? 0 : 1);
 
-                /* Print 3 lines before and 3 lines after the error */
                 if (current_line >= gen_line - 3 && current_line <= gen_line + 3) {
                     char marker = (current_line == gen_line) ? '>' : ' ';
                     fprintf(stderr, "%c %4d | %.*s\n", marker, current_line, (int)line_len, line_start);
@@ -176,16 +140,52 @@ static void report_error_with_code(const char *msg, const char *in_path,
     }
 }
 
-/* ---- core expand ----------------------------------------------------------
-* Parses `in_path` as a .tmg template, builds a synthetic Lua chunk, and
-* runs it in the caller's lua_State L (so it sees whatever the build script
-* already `require`d / set up). On success leaves the rendered string on
-* top of the Lua stack and returns true. On failure the stack is left as it
-* was, an error is reported to stderr, and false is returned. This is the
-* shared core behind both tmg_render (writes to a file) and
-* tmg_render_string (hands the string back to the caller); it never touches
-* Lua's stdout/stderr itself, so a build script's own logging can never
-* collide with template output. */
+/* Safely flushes accumulated text as yield([==[...]==]) with dynamic equal sign counting */
+static void flush_text_buffer(str_t *builder, str_t *buffer, linemap_t *lm, int *gen_line, int cur_line) {
+    if (buffer->len == 0) return;
+
+    /* Find maximum consecutive '=' between ']' and ']' in buffer to prevent delimiter collision */
+    int max_equals = 0;
+    for (size_t i = 0; i < buffer->len; i++) {
+        if (buffer->data[i] == ']') {
+            int equals = 0;
+            size_t j = i + 1;
+            while (j < buffer->len && buffer->data[j] == '=') {
+                equals++;
+                j++;
+            }
+            if (j < buffer->len && buffer->data[j] == ']') {
+                if (equals >= max_equals) {
+                    max_equals = equals + 1;
+                }
+            }
+        }
+    }
+
+    /* Build opening long bracket: yield([==...==[ */
+    str_push(builder, "yield([");
+    for (int i = 0; i < max_equals; i++) str_push_chr(builder, '=');
+    str_push_chr(builder, '[');
+
+    /* Push body content verbatim and track line map alignment */
+    for (size_t i = 0; i < buffer->len; i++) {
+        char ch = buffer->data[i];
+        str_push_chr(builder, ch);
+        if (ch == '\n') {
+            note_newline(lm, gen_line, cur_line);
+        }
+    }
+
+    /* Build closing long bracket: ]==...==]) */
+    str_push_chr(builder, ']');
+    for (int i = 0; i < max_equals; i++) str_push_chr(builder, '=');
+    str_push(builder, "])\n");
+    note_newline(lm, gen_line, cur_line);
+    str_clear(buffer);
+}
+
+/* ---- core expand ---------------------------------------------------------- */
+
 static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool debug)
 {
     FILE *in = fopen(in_path, "r");
@@ -205,54 +205,36 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
     linemap_t lm    = linemap_init();
     int gen_line    = 1;
     int cur_line    = 1;
-    linemap_push(&lm, cur_line); /* gen line 1 -> orig line 1 */
+    linemap_push(&lm, cur_line);
 
-    str_push(&builder, "local out = {}\n");
+    /* Setup yield handle and tmg metatable interface */
+    str_push(&builder, "local yield = coroutine.yield\n");
     note_newline(&lm, &gen_line, cur_line);
-    str_push(&builder, "local tmg = setmetatable({print = function(v) out[#out+1] = tostring(v) end}, {__index = tmg})\n");
+    str_push(&builder, "local tmg = setmetatable({print = function(v) yield(tostring(v)) end}, {__index = tmg})\n");
     note_newline(&lm, &gen_line, cur_line);
 
     bool code = false;
-    bool inline_code = false;
     bool escape_next = false;
     int c;
-
-    /* Helper lambda/block logic for pushing escaped text to buffer */
-    #define PUSH_TEXT_CHAR(ch) do { \
-        switch (ch) { \
-            case '\\': str_push(&buffer, "\\\\"); break; \
-            case '\n': str_push(&buffer, "\\n");  break; \
-            case '\r': str_push(&buffer, "\\r");  break; \
-            case '\t': str_push(&buffer, "\\t");  break; \
-            case '"':  str_push(&buffer, "\\\""); break; \
-            default:   str_push_chr(&buffer, ch); break; \
-        } \
-    } while(0)
 
     while ((c = fgetc(in)) != EOF) {
         if (c == '\n') cur_line++;
 
-        /* Handle escape sequence (\) directly */
         if (escape_next) {
             escape_next = false;
             if (code) {
-                /* In code mode, `\` only has meaning to tmg when it's
-                 * suppressing a char that would otherwise start matching
-                 * the delimiter (e.g. `\%` so a literal `%` inside Lua
-                 * code, like string.format's "%d", doesn't end the code
-                 * block). Anything else is the user's own Lua source -
-                 * their own `\n`, `\t`, `\\`, `\"` escapes inside a string
-                 * literal they wrote - and must pass through untouched,
-                 * backslash included, or we silently corrupt their code. */
+                /* Code mode: '\' only suppresses delimiter start; otherwise keep '\' */
                 bool suppresses_delim = sepsize > 0 && (unsigned char)c == (unsigned char)sep[0];
                 if (!suppresses_delim) str_push_chr(&builder, '\\');
                 str_push_chr(&builder, (char)c);
                 if (c == '\n') note_newline(&lm, &gen_line, cur_line);
             } else if (c == '\n') {
-                /* text mode: `\<newline>` is a line-continuation - swallow
-                 * the newline itself so it doesn't appear in the buffer. */
+                /* Text mode: '\<newline>' line continuation swallower */
             } else {
-                PUSH_TEXT_CHAR((char)c);
+                /* Text mode: If '\' wasn't suppressing a delimiter, pass '\' as raw text */
+                bool suppresses_delim = sepsize > 0 && (unsigned char)c == (unsigned char)sep[0];
+                if (!suppresses_delim) str_push_chr(&buffer, '\\');
+                str_push_chr(&buffer, (char)c);
             }
             continue;
         }
@@ -262,91 +244,56 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
             continue;
         }
 
-        /* Buffer potential delimiter match */
         str_push_chr(&match_buf, (char)c);
 
         if (match_buf.len <= sepsize && strncmp(match_buf.data, sep, match_buf.len) == 0) {
-            /* Full delimiter matched */
             if (match_buf.len == sepsize) {
-                if (inline_code) {
-                    str_push(&builder, ")");
-                    inline_code = false;
-                }
                 str_push_chr(&builder, '\n');
                 note_newline(&lm, &gen_line, cur_line);
 
                 code = !code;
 
-                if (buffer.len > 0) {
-                    if (only_whitespace(buffer.data)) {
-                        str_clear(&buffer);
-                    } else {
-                        str_push(&builder, "out[#out+1] = \"");
-                        str_push(&builder, buffer.data);
-                        str_push(&builder, "\"\n");
-                        note_newline(&lm, &gen_line, cur_line);
-                        str_clear(&buffer);
-                    }
-                }
+                flush_text_buffer(&builder, &buffer, &lm, &gen_line, cur_line);
                 str_clear(&match_buf);
             }
             continue;
         }
 
-        /* Match failed: Flush match_buf byte-by-byte safely */
         for (size_t i = 0; i < match_buf.len; i++) {
             char ch = match_buf.data[i];
             if (code) {
-                if (ch == '$') {
-                    inline_code = true;
-                    str_push(&builder, "tmg.print(");
-                    continue;
-                }
                 str_push_chr(&builder, ch);
                 if (ch == '\n') note_newline(&lm, &gen_line, cur_line);
             } else {
-                PUSH_TEXT_CHAR(ch);
+                str_push_chr(&buffer, ch);
             }
         }
         str_clear(&match_buf);
     }
     fclose(in);
 
-    /* Flush leftover buffer if file ends with trailing backslash or partial match */
     if (escape_next) {
         if (code) str_push_chr(&builder, '\\');
-        else PUSH_TEXT_CHAR('\\');
+        else str_push_chr(&buffer, '\\');
     }
 
     if (match_buf.len > 0) {
         for (size_t i = 0; i < match_buf.len; i++) {
             char ch = match_buf.data[i];
             if (code) str_push_chr(&builder, ch);
-            else PUSH_TEXT_CHAR(ch);
+            else str_push_chr(&buffer, ch);
         }
         str_clear(&match_buf);
     }
 
-    if (buffer.len > 0) {
-        str_push(&builder, "out[#out+1] = \"");
-        str_push(&builder, buffer.data);
-        str_push(&builder, "\"\n");
-        note_newline(&lm, &gen_line, cur_line);
-        str_clear(&buffer);
-    }
-
-    str_push(&builder, "return table.concat(out)\n");
-    note_newline(&lm, &gen_line, cur_line);
+    flush_text_buffer(&builder, &buffer, &lm, &gen_line, cur_line);
 
     if (debug) {
         fprintf(stderr, "-- generated chunk for %s --\n%s-- end --\n",
                 in_path, builder.data);
     }
 
-    bool success = false;
-
-    lua_pushcfunction(L, msghandler);
-    int msgh_idx = lua_gettop(L);
+    /* ---- Coroutine Execution Engine ---- */
 
     char chunkname[1024];
     snprintf(chunkname, sizeof(chunkname), "@%s", in_path);
@@ -354,32 +301,63 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
     if (luaL_loadbuffer(L, builder.data, builder.len, chunkname) != LUA_OK) {
         report_error_with_code(lua_tostring(L, -1), in_path, &lm, builder.data);
         lua_pop(L, 1);
-    } else if (lua_pcall(L, 0, 1, msgh_idx) != LUA_OK) {
-        report_error_with_code(lua_tostring(L, -1), in_path, &lm, builder.data);
-        lua_pop(L, 1);
-    } else if (lua_isstring(L, -1)) {
+        str_deinit(&builder);
+        str_deinit(&buffer);
+        str_deinit(&match_buf);
+        linemap_deinit(&lm);
+        return false;
+    }
+
+    /* Create thread context */
+    lua_State *co = lua_newthread(L);
+    lua_pushvalue(L, -2); /* duplicate chunk function */
+    lua_xmove(L, co, 1);  /* move function onto thread stack */
+
+    str_t final_output = str_init(in_size * 2);
+    bool success = false;
+
+    int status = lua_resume(co, 0);
+
+    while (status == LUA_YIELD) {
+        int top = lua_gettop(co);
+        for (int i = 1; i <= top; i++) {
+            if (lua_isstring(co, i)) {
+                size_t len;
+                const char *chunk = lua_tolstring(co, i, &len);
+                str_push(&final_output, chunk);
+            }
+        }
+        lua_pop(co, top);
+
+        status = lua_resume(co, 0);
+    }
+
+    if (status == LUA_OK) {
+        /* Clean thread and chunk function off main stack BEFORE pushing result */
+        lua_pop(L, 2); /* pops 'co' and loaded chunk function */
+
+        /* Push result string - now it is strictly on top of stack L */
+        lua_pushlstring(L, final_output.data, final_output.len);
         success = true;
     } else {
-        fprintf(stderr, "ERR: %s: template did not produce a string result\n", in_path);
-        lua_pop(L, 1);
+        /* Runtime error during coroutine streaming */
+        report_error_with_code(lua_tostring(co, -1), in_path, &lm, builder.data);
+        lua_pop(L, 2); /* pop thread and function on error */
     }
-    lua_remove(L, msgh_idx);
 
+    str_deinit(&final_output);
     str_deinit(&builder);
     str_deinit(&buffer);
     str_deinit(&match_buf);
     linemap_deinit(&lm);
 
     return success;
-
-    #undef PUSH_TEXT_CHAR
 }
 
 /* Parses+runs the template and writes the rendered result to out_path via C
 * stdio directly (never through Lua's io library). */
 bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
                 const char *sep, bool debug)
-
 {
     if (!tmg_expand(L, in_path, sep, debug)) return false;
 
@@ -388,7 +366,7 @@ bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
     FILE *out = fopen(out_path, "w");
     if (!out) {
         fprintf(stderr, "ERR: Failed to create the output file `%s`: %s\n",
-        out_path, strerror(errno));
+                out_path, strerror(errno));
     } else {
         fputs(result, out);
         fclose(out);
@@ -398,12 +376,8 @@ bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
     return success;
 }
 
-/* Parses+runs the template and hands the rendered string back to Lua
-* instead of writing it anywhere. Writing (if any) is then the calling
-* Lua code's responsibility, via normal Lua io. */
 bool tmg_render_string(lua_State *L, const char *in_path, const char *sep, bool debug)
 {
-    /* leaves result string on stack on success, matching tmg_expand */
     return tmg_expand(L, in_path, sep, debug);
 }
 
@@ -444,17 +418,13 @@ static int l_tmg_render(lua_State *L) {
     return 1;
 }
 
-/* tmg.render_string(in_path [, sep]) -> string | nil
-* Same parsing/execution as tmg.render, but returns the rendered text
-* instead of writing it to a file. Writing it (or not) is on the Lua side
-* from here on: `local f = io.open(path, "w"); f:write(result); f:close()`. */
 static int l_tmg_render_string(lua_State *L) {
     const char *in_path = luaL_checkstring(L, 1);
     const char *sep = resolve_sep(L, 2);
     bool debug = resolve_debug(L);
 
     if (tmg_render_string(L, in_path, sep, debug)) {
-        return 1; /* result string already on top of the stack */
+        return 1;
     }
     lua_pushnil(L);
     return 1;
@@ -471,10 +441,6 @@ int luaopen_tmg(lua_State *L) {
     return 1;
 }
 
-/* ---- entrypoint --------------------------------------------------------
-* tmg is a Lua runtime with templating built in: it does not render
-* anything by itself. Point it at a build script; the script calls
-* tmg.render(in, out) for every template it wants written. */
 int main(int argc, char **argv)
 {
     struct popt *opt = parse_args(argc, argv);
@@ -496,7 +462,7 @@ int main(int argc, char **argv)
     }
     luaL_openlibs(L);
 
-    luaL_requiref(L, "tmg", luaopen_tmg, 1); /* also sets global `tmg` */
+    luaL_requiref(L, "tmg", luaopen_tmg, 1);
     lua_pop(L, 1);
 
     int exit_code = EXIT_SUCCESS;
