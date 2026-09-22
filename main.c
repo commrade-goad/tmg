@@ -1,3 +1,4 @@
+#include <luajit.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,27 @@
 
 #include "argparse.h"
 #include "str.h"
+
+#ifndef luaL_requiref
+static void luaL_requiref(lua_State *L, const char *modname, lua_CFunction openf, int glb) {
+    lua_pushcfunction(L, openf);
+    lua_pushstring(L, modname);
+    lua_call(L, 1, 1); /* call openf(modname) */
+
+    /* Get registry["_LOADED"] */
+    lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+    if (lua_istable(L, -1)) {
+        lua_pushvalue(L, -2);          /* push module copy */
+        lua_setfield(L, -2, modname);  /* _LOADED[modname] = module */
+    }
+    lua_pop(L, 1); /* pop _LOADED table */
+
+    if (glb) {
+        lua_pushvalue(L, -1);          /* push module copy */
+        lua_setglobal(L, modname);     /* _G[modname] = module */
+    }
+}
+#endif
 
 /* ---- generated-line -> original-line map ------------------------------ */
 
@@ -124,6 +146,8 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
 
     str_push(&builder, "local out = {}\n");
     note_newline(&lm, &gen_line, cur_line);
+    str_push(&builder, "local tmg = setmetatable({print = function(v) out[#out+1] = tostring(v) end}, {__index = tmg})\n");
+    note_newline(&lm, &gen_line, cur_line);
 
     bool code = false;
     bool inline_code = false;
@@ -212,7 +236,7 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
             if (code) {
                 if (ch == '$') {
                     inline_code = true;
-                    str_push(&builder, "out[#out+1] = tostring(");
+                    str_push(&builder, "tmg.print(");
                     continue;
                 }
                 str_push_chr(&builder, ch);
