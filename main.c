@@ -163,7 +163,7 @@ static void flush_text_buffer(str_t *builder, str_t *buffer, linemap_t *lm, int 
     }
 
     /* Build opening long bracket: yield([==...==[ */
-    str_push(builder, "yield([");
+    str_push(builder, "tmg.print([");
     for (int i = 0; i < max_equals; i++) str_push_chr(builder, '=');
     str_push_chr(builder, '[');
 
@@ -206,12 +206,6 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
     int gen_line    = 1;
     int cur_line    = 1;
     linemap_push(&lm, cur_line);
-
-    /* Setup yield handle and tmg metatable interface */
-    str_push(&builder, "local yield = coroutine.yield\n");
-    note_newline(&lm, &gen_line, cur_line);
-    str_push(&builder, "local tmg = setmetatable({print = function(v) yield(tostring(v)) end}, {__index = tmg})\n");
-    note_newline(&lm, &gen_line, cur_line);
 
     bool code = false;
     bool escape_next = false;
@@ -407,6 +401,18 @@ static bool resolve_debug(lua_State *L) {
     return debug;
 }
 
+static int l_tmg_print(lua_State *L) {
+    luaL_checkany(L, 1);
+    lua_settop(L, 1);
+
+    if (!lua_isstring(L, 1)) {
+        lua_pushstring(L, lua_tolstring(L, 1, NULL));
+        lua_replace(L, 1);
+    }
+
+    return lua_yield(L, 1);
+}
+
 static int l_tmg_render(lua_State *L) {
     const char *in_path  = luaL_checkstring(L, 1);
     const char *out_path = luaL_checkstring(L, 2);
@@ -433,6 +439,7 @@ static int l_tmg_render_string(lua_State *L) {
 static const luaL_Reg tmg_lib[] = {
     {"render", l_tmg_render},
     {"render_string", l_tmg_render_string},
+    {"print", l_tmg_print},
     {NULL, NULL}
 };
 
