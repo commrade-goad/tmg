@@ -128,3 +128,19 @@ comment in LaTeX, so pick another delimiter, e.g. `tmg_delim = "@@"`:
 Hand-written LaTeX stays untouched, generated parts come from Lua. A code
 block ends at the next delimiter, so don't write it inside Lua comments.
 See `example/latex-build.lua` and `example/latex-demo.tmg`.
+
+## raylib
+`lib/raylib-luajit-generated` is a submodule with LuaJIT ffi bindings for raylib
+(`git submodule update --init`). `lib/raylib.lua` is the glue that makes
+`require("raylib")` work from any directory: the binding itself expects to run
+from its own repo root and only uses the system library path.
+
+```sh
+TMG_LIB_PATH=/path/to/tmg/lib:/dir/with/libs tmg example/raylib-demo.lua
+```
+
+* `libraylib.so` (raylib 5.5, shared build) is looked up in `TMG_LIB_PATH`, then
+  in the binding's `raylib/` dir, then the system paths (`LD_LIBRARY_PATH`...).
+* `libphysac.so` is optional; without it a warning is printed and the physac
+  functions are unavailable. See the binding's README for building it.
+* Set `RAYLIB_LUAJIT_DIR` if the binding lives somewhere else.
