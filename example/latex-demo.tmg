@@ -1,0 +1,32 @@
+\documentclass[11pt]{article}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\begin{document}
+@@
+-- The delimiter here is set by tmg_delim in latex-build.lua; a code block
+-- ends at the next delimiter, so never write it inside Lua comments.
+-- Locals live for the whole template, across blocks.
+local L = require("latex")
+local results = {
+  { "baseline",  120, 3.5 },
+  { "optimized",  80, 2.1 },
+}
+@@
+\section{Results}
+This part is hand-written \LaTeX{}, 100\% untouched; % a real LaTeX comment
+the parts below are generated from Lua data.
+
+@@ L.print(L.table{
+  caption = "Timings", label = "tab:timings", cols = "lrr",
+  header  = { "Variant", "Time (ms)", "Mem (MB)" },
+  rows    = results,
+}) @@
+
+@@ for _, r in ipairs(results) do @@
+\noindent @@ L.print(L.bf(r[1])) @@ takes @@ L.print(r[2]) @@ ms (escaped: @@ L.print("a_b & 50%") @@).
+@@ end @@
+
+@@ L.print(L.eq{ "t = \\sum_i t_i", label = "eq:total" }) @@
+
+Total (tmg.print takes nodes too): @@ tmg.print(L.m("t = " .. results[1][2] + results[2][2])) @@.
+\end{document}

@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h>
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
@@ -375,6 +376,150 @@ bool tmg_render_string(lua_State *L, const char *in_path, const char *sep, bool 
     return tmg_expand(L, in_path, sep, debug);
 }
 
+/* ---- TMG_LIB_PATH ---------------------------------------------------------- */
+
+#define LIBDIRS_KEY "tmg.libdirs"
+
+#if LUA_VERSION_NUM >= 502
+#define tmg_objlen(L, i) ((int)lua_rawlen((L), (i)))
+#else
+#define tmg_objlen(L, i) ((int)lua_objlen((L), (i)))
+#endif
+
+/* TMG_LIB_PATH=dir1:dir2 -> every dir is added to package.path (.lua files,
+ * and dir/name/init.lua) and package.cpath (.so modules). Entries are
+ * prepended in the order given, so they win over the system defaults and
+ * dir1 wins over dir2. Empty entries are ignored.
+ *
+ * The parsed dirs are also kept in the registry (see tmg.find_lib and
+ * tmg.lib_path), even when the variable is unset (then the list is empty). */
+static void setup_lib_path(lua_State *L)
+{
+    const char *env = getenv("TMG_LIB_PATH");
+
+    lua_newtable(L);
+    int dirs = lua_gettop(L);
+    int n = 0;
+
+    str_t lpath = str_init(256);
+    str_t cpath = str_init(128);
+
+    for (const char *p = env; p && *p; ) {
+        const char *end = strchr(p, ':');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+
+        if (len > 0) {
+            /* drop a trailing '/' so we don't produce "dir//?.lua" */
+            while (len > 1 && p[len - 1] == '/') len--;
+
+            char *dir = malloc(len + 1);
+            memcpy(dir, p, len);
+            dir[len] = '\0';
+
+            lua_pushlstring(L, dir, len);
+            lua_rawseti(L, dirs, ++n);
+
+            str_push(&lpath, dir); str_push(&lpath, "/?.lua;");
+            str_push(&lpath, dir); str_push(&lpath, "/?/init.lua;");
+            str_push(&cpath, dir); str_push(&cpath, "/?.so;");
+            free(dir);
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+
+    lua_pushvalue(L, dirs);
+    lua_setfield(L, LUA_REGISTRYINDEX, LIBDIRS_KEY);
+
+    lua_getglobal(L, "package");
+    if (n > 0 && lua_istable(L, -1)) {
+        lua_pushlstring(L, lpath.data, lpath.len);
+        lua_getfield(L, -2, "path");
+        lua_concat(L, 2);                 /* ours .. old */
+        lua_setfield(L, -2, "path");
+
+        lua_pushlstring(L, cpath.data, cpath.len);
+        lua_getfield(L, -2, "cpath");
+        lua_concat(L, 2);
+        lua_setfield(L, -2, "cpath");
+    }
+    lua_pop(L, 2); /* package, dirs */
+
+    str_deinit(&lpath);
+    str_deinit(&cpath);
+}
+
+/* tmg.find_lib(name) -> path | nil, err
+ *
+ * Looks for a shared library in every TMG_LIB_PATH dir, in order, and returns
+ * the first match, ready to hand to ffi.load():
+ *
+ *   find_lib("raylib")         -> <dir>/libraylib.so, then <dir>/raylib.so
+ *   find_lib("native/raylib")  -> <dir>/native/libraylib.so, ...
+ *   find_lib("libfoo.so.2")    -> <dir>/libfoo.so.2        (explicit file name)
+ *   find_lib("/abs/libx.so")   -> returned as is if it exists
+ */
+static int l_tmg_find_lib(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+
+    /* split "sub/dir/base" into "sub/dir/" and "base" */
+    const char *slash = strrchr(name, '/');
+    size_t sublen = slash ? (size_t)(slash - name) + 1 : 0;
+    const char *base = name + sublen;
+    char sub[1024];
+    if (sublen >= sizeof(sub)) return luaL_error(L, "find_lib: name too long");
+    memcpy(sub, name, sublen);
+    sub[sublen] = '\0';
+
+    if (name[0] == '/') {
+        if (access(name, R_OK) == 0) { lua_pushstring(L, name); return 1; }
+        lua_pushnil(L);
+        lua_pushfstring(L, "library '%s' not found", name);
+        return 2;
+    }
+
+    if (*base == '\0') return luaL_error(L, "find_lib: empty library name");
+
+    /* a name that already looks like a file ("foo.so", "libfoo.so.2") is
+     * taken literally; a bare name gets the lib<name>.so / <name>.so forms */
+    bool literal = strstr(base, ".so") != NULL;
+    const char *fmts[2] = { literal ? "%s/%s%s" : "%s/%slib%s.so",
+                            literal ? NULL     : "%s/%s%s.so" };
+
+    lua_getfield(L, LUA_REGISTRYINDEX, LIBDIRS_KEY);
+    int n = lua_istable(L, -1) ? tmg_objlen(L, -1) : 0;
+
+    str_t tried = str_init(256);
+    char cand[4096];
+
+    for (int i = 1; i <= n; i++) {
+        lua_rawgeti(L, -1, i);
+        const char *dir = lua_tostring(L, -1);
+        for (int f = 0; f < 2 && fmts[f]; f++) {
+            int w = snprintf(cand, sizeof(cand), fmts[f], dir, sub, base);
+            if (w < 0 || (size_t)w >= sizeof(cand)) continue;
+            if (access(cand, R_OK) == 0) {
+                lua_pushstring(L, cand);
+                str_deinit(&tried);
+                return 1;
+            }
+            str_push(&tried, "\n\tno file '");
+            str_push(&tried, cand);
+            str_push_chr(&tried, '\'');
+        }
+        lua_pop(L, 1);
+    }
+
+    lua_pushnil(L);
+    if (n == 0)
+        lua_pushfstring(L, "library '%s' not found (TMG_LIB_PATH is empty)", name);
+    else
+        lua_pushfstring(L, "library '%s' not found in TMG_LIB_PATH:%s",
+                        name, tried.data ? tried.data : "");
+    str_deinit(&tried);
+    return 2;
+}
+
 /* ---- Lua-facing glue ------------------------------------------------- */
 
 static const char *resolve_sep(lua_State *L, int idx) {
@@ -406,8 +551,14 @@ static int l_tmg_print(lua_State *L) {
     lua_settop(L, 1);
 
     if (!lua_isstring(L, 1)) {
-        lua_pushstring(L, lua_tolstring(L, 1, NULL));
-        lua_replace(L, 1);
+        if (luaL_callmeta(L, 1, "__tostring")) {
+            /* objects with __tostring (e.g. latex nodes) print as that string */
+            lua_replace(L, 1);
+            lua_settop(L, 1);
+        } else {
+            lua_pushstring(L, lua_tolstring(L, 1, NULL));
+            lua_replace(L, 1);
+        }
     }
 
     return lua_yield(L, 1);
@@ -440,11 +591,15 @@ static const luaL_Reg tmg_lib[] = {
     {"render", l_tmg_render},
     {"render_string", l_tmg_render_string},
     {"print", l_tmg_print},
+    {"find_lib", l_tmg_find_lib},
     {NULL, NULL}
 };
 
 int luaopen_tmg(lua_State *L) {
     luaL_newlib(L, tmg_lib);
+    lua_getfield(L, LUA_REGISTRYINDEX, LIBDIRS_KEY);
+    if (lua_istable(L, -1)) lua_setfield(L, -2, "lib_path");
+    else lua_pop(L, 1);
     return 1;
 }
 
@@ -468,6 +623,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     luaL_openlibs(L);
+    setup_lib_path(L);
 
     luaL_requiref(L, "tmg", luaopen_tmg, 1);
     lua_pop(L, 1);
