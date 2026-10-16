@@ -51,6 +51,25 @@ running in, anything the script `require`s or sets as a global is visible
 to every template it renders — set shared state once at the top of
 `build.lua` instead of repeating it per template.
 
+### Script arguments
+Everything after the script name is passed to the script, as in plain Lua:
+
+```sh
+tmg build.lua prod --verbose "two words"
+```
+
+```lua
+-- build.lua
+local env = ...                -- varargs of the main chunk: "prod", "--verbose", "two words"
+print(arg[0])                  -- "build.lua"
+print(#arg, arg[1], arg[2])    -- 3  prod  --verbose
+print(arg[-1])                 -- the tmg binary, as invoked
+```
+
+`arg` is a normal global, so templates rendered by the script can read it too.
+`tmg`'s own options (`-h`, `-v`) are only recognized *before* the script name,
+so `tmg build.lua -v` hands `-v` to your script.
+
 ## Extra library paths
 Set `TMG_LIB_PATH` to a `:`-separated list of directories to make your own
 Lua/LuaJIT modules available to `require` (from `build.lua` and from

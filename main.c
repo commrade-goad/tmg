@@ -603,6 +603,19 @@ int luaopen_tmg(lua_State *L) {
     return 1;
 }
 
+/* Standard Lua convention: global `arg` with arg[0] = script, arg[1..n] = the
+ * script's arguments and arg[-1] = the interpreter (negative indices go back
+ * through argv). The same arguments are also passed to the main chunk as `...`. */
+static void set_arg_table(lua_State *L, int argc, char **argv, int script_idx)
+{
+    lua_createtable(L, argc - script_idx - 1, script_idx + 1);
+    for (int i = 0; i < argc; i++) {
+        lua_pushstring(L, argv[i]);
+        lua_rawseti(L, -2, i - script_idx);
+    }
+    lua_setglobal(L, "arg");
+}
+
 int main(int argc, char **argv)
 {
     struct popt *opt = parse_args(argc, argv);
@@ -611,7 +624,7 @@ int main(int argc, char **argv)
 
     if (!opt->script) {
         fprintf(stderr, "ERR: no build script given.\n");
-        fprintf(stderr, "Usage: %s <script.lua>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <script.lua> [args...]\n", argv[0]);
         cleanup_args(opt);
         return EXIT_FAILURE;
     }
@@ -624,6 +637,7 @@ int main(int argc, char **argv)
     }
     luaL_openlibs(L);
     setup_lib_path(L);
+    set_arg_table(L, argc, argv, opt->script_idx);
 
     luaL_requiref(L, "tmg", luaopen_tmg, 1);
     lua_pop(L, 1);
@@ -637,10 +651,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "ERR: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
         exit_code = EXIT_FAILURE;
-    } else if (lua_pcall(L, 0, 0, msgh_idx) != LUA_OK) {
-        fprintf(stderr, "ERR: %s\n", lua_tostring(L, -1));
-        lua_pop(L, 1);
-        exit_code = EXIT_FAILURE;
+    } else {
+        /* the script's arguments are also the varargs of its main chunk */
+        int nargs = argc - opt->script_idx - 1;
+        luaL_checkstack(L, nargs, "too many script arguments");
+        for (int i = opt->script_idx + 1; i < argc; i++)
+            lua_pushstring(L, argv[i]);
+
+        if (lua_pcall(L, nargs, 0, msgh_idx) != LUA_OK) {
+            fprintf(stderr, "ERR: %s\n", lua_tostring(L, -1));
+            lua_pop(L, 1);
+            exit_code = EXIT_FAILURE;
+        }
     }
     lua_remove(L, msgh_idx);
 

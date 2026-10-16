@@ -5,6 +5,8 @@
 
 struct popt {
     char *script;
+    int script_idx;   /* index of the script in argv; everything after it
+                         belongs to the script (see arg / ... in Lua) */
     bool exit;
 };
 

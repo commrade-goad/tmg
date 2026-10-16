@@ -11,9 +11,12 @@ static inline void print_version(const char *name) {
 }
 
 static inline void print_help(const char *name) {
-    printf("%s <script.lua>\n", name);
+    printf("%s <script.lua> [args...]\n", name);
     printf("  -h : print this help\n");
     printf("  -v : print version\n\n");
+    printf("Everything after the script name is passed to the script, as in\n");
+    printf("plain Lua: the global table `arg` (arg[0] is the script, arg[1..n]\n");
+    printf("the arguments) and as `...` in the script's main chunk.\n\n");
     printf("tmg is a Lua runtime with templating built in. Write a build\n");
     printf("script that calls tmg.render(input, output [, delim]) to render\n");
     printf("`.tmg` templates. Set a global tmg_delim before calling render to\n");
@@ -24,6 +27,7 @@ static inline void print_help(const char *name) {
 struct popt *parse_args(int argc, char **argv) {
     struct popt *ret = malloc(sizeof(struct popt));
     ret->script = NULL;
+    ret->script_idx = 0;
     ret->exit = false;
 
     for (int i = 1; i < argc; i++) {
@@ -38,9 +42,11 @@ struct popt *parse_args(int argc, char **argv) {
             ret->exit = true;
             return ret;
         }
-        if (!ret->script) {
-            ret->script = cur;
-        }
+        /* first non-option is the script; the rest is for the script, so
+         * stop here (a later -h / -v must not be swallowed by tmg) */
+        ret->script = cur;
+        ret->script_idx = i;
+        break;
     }
     return ret;
 }
