@@ -1,5 +1,6 @@
 #include <luajit.h>
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -11,7 +12,46 @@
 #include <lauxlib.h>
 
 #include "argparse.h"
+#include "http.h"
 #include "str.h"
+
+#define TMG_RAW_MT "tmg.raw"
+
+typedef struct {
+    size_t len;
+    char data[];
+} tmg_raw_t;
+
+static tmg_raw_t *tmg_raw_check(lua_State *L, int idx) {
+    if (!lua_getmetatable(L, idx))
+        return NULL;
+    luaL_getmetatable(L, TMG_RAW_MT);
+    bool same = lua_rawequal(L, -1, -2) != 0;
+    lua_pop(L, 2);
+    return same ? (tmg_raw_t *)lua_touserdata(L, idx) : NULL;
+}
+
+static void tmg_push_raw(lua_State *L, const char *s, size_t len) {
+    tmg_raw_t *raw = (tmg_raw_t *)lua_newuserdata(L, sizeof(*raw) + len + 1);
+    raw->len = len;
+    if (len) memcpy(raw->data, s, len);
+    raw->data[len] = '\0';
+    luaL_getmetatable(L, TMG_RAW_MT);
+    lua_setmetatable(L, -2);
+}
+
+static void tmg_push_escaped(str_t *out, const char *s, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        switch ((unsigned char)s[i]) {
+        case '&': str_push(out, "&amp;"); break;
+        case '<': str_push(out, "&lt;"); break;
+        case '>': str_push(out, "&gt;"); break;
+        case '"': str_push(out, "&quot;"); break;
+        case '\'': str_push(out, "&#39;"); break;
+        default: str_push_chr(out, s[i]); break;
+        }
+    }
+}
 
 #ifndef luaL_requiref
 static void luaL_requiref(lua_State *L, const char *modname, lua_CFunction openf, int glb) {
@@ -145,17 +185,37 @@ static void report_error_with_code(const char *msg, const char *in_path,
 static void flush_text_buffer(str_t *builder, str_t *buffer, linemap_t *lm, int *gen_line, int cur_line) {
     if (buffer->len == 0) return;
 
+    /* Lua long strings skip a newline immediately after the opening bracket.
+     * Emit any leading newlines as an escaped quoted string first. */
+    size_t start = 0;
+    while (start < buffer->len && buffer->data[start] == '\n')
+        start++;
+    if (start > 0) {
+        str_push(builder, "tmg.print_raw(\"");
+        for (size_t i = 0; i < start; i++)
+            str_push(builder, "\\n");
+        str_push(builder, "\")\n");
+        note_newline(lm, gen_line, cur_line);
+    }
+    if (start == buffer->len) {
+        str_clear(buffer);
+        return;
+    }
+
+    const char *body = buffer->data + start;
+    size_t body_len = buffer->len - start;
+
     /* Find maximum consecutive '=' between ']' and ']' in buffer to prevent delimiter collision */
     int max_equals = 0;
-    for (size_t i = 0; i < buffer->len; i++) {
-        if (buffer->data[i] == ']') {
+    for (size_t i = 0; i < body_len; i++) {
+        if (body[i] == ']') {
             int equals = 0;
             size_t j = i + 1;
-            while (j < buffer->len && buffer->data[j] == '=') {
+            while (j < body_len && body[j] == '=') {
                 equals++;
                 j++;
             }
-            if (j < buffer->len && buffer->data[j] == ']') {
+            if (j < body_len && body[j] == ']') {
                 if (equals >= max_equals) {
                     max_equals = equals + 1;
                 }
@@ -164,13 +224,13 @@ static void flush_text_buffer(str_t *builder, str_t *buffer, linemap_t *lm, int 
     }
 
     /* Build opening long bracket: yield([==...==[ */
-    str_push(builder, "tmg.print([");
+    str_push(builder, "tmg.print_raw([");
     for (int i = 0; i < max_equals; i++) str_push_chr(builder, '=');
     str_push_chr(builder, '[');
 
     /* Push body content verbatim and track line map alignment */
-    for (size_t i = 0; i < buffer->len; i++) {
-        char ch = buffer->data[i];
+    for (size_t i = 0; i < body_len; i++) {
+        char ch = body[i];
         str_push_chr(builder, ch);
         if (ch == '\n') {
             note_newline(lm, gen_line, cur_line);
@@ -187,21 +247,34 @@ static void flush_text_buffer(str_t *builder, str_t *buffer, linemap_t *lm, int 
 
 /* ---- core expand ---------------------------------------------------------- */
 
-static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool debug)
+static void tmg_set_error(str_t *err, const char *msg) {
+    if (!err) return;
+    str_clear(err);
+    str_push(err, msg ? msg : "(unknown error)");
+}
+
+static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool debug,
+                       int data_idx, bool html, str_t *err)
 {
     FILE *in = fopen(in_path, "r");
     if (!in) {
-        fprintf(stderr, "ERR: Failed to read the input file `%s`: %s\n",
-                in_path, strerror(errno));
+        char msg[1024];
+        snprintf(msg, sizeof(msg), "failed to read `%s`: %s", in_path, strerror(errno));
+        fprintf(stderr, "ERR: %s\n", msg);
+        tmg_set_error(err, msg);
         return false;
     }
     fseek(in, 0, SEEK_END);
-    long in_size = ftell(in);
+    long file_size = ftell(in);
     rewind(in);
+    size_t in_size = file_size > 0 ? (size_t)file_size : 0;
+    int initial_cap = 16;
+    if (in_size > 0 && in_size <= (size_t)INT_MAX / 2)
+        initial_cap = (int)(in_size * 2);
 
     size_t sepsize = strlen(sep);
     str_t match_buf = str_init(sepsize + 1);
-    str_t builder   = str_init(in_size * 2);
+    str_t builder   = str_init(initial_cap);
     str_t buffer    = str_init(100);
     linemap_t lm    = linemap_init();
     int gen_line    = 1;
@@ -294,7 +367,9 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
     snprintf(chunkname, sizeof(chunkname), "@%s", in_path);
 
     if (luaL_loadbuffer(L, builder.data, builder.len, chunkname) != LUA_OK) {
-        report_error_with_code(lua_tostring(L, -1), in_path, &lm, builder.data);
+        const char *msg = lua_tostring(L, -1);
+        tmg_set_error(err, msg);
+        report_error_with_code(msg, in_path, &lm, builder.data);
         lua_pop(L, 1);
         str_deinit(&builder);
         str_deinit(&buffer);
@@ -308,10 +383,19 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
     lua_pushvalue(L, -2); /* duplicate chunk function */
     lua_xmove(L, co, 1);  /* move function onto thread stack */
 
-    str_t final_output = str_init(in_size * 2);
+    /* Per-request data is passed as the template chunk's vararg, so
+     * templates can use `local data = ...` without touching globals. */
+    int nargs = 0;
+    if (data_idx > 0) {
+        lua_pushvalue(L, data_idx);
+        lua_xmove(L, co, 1);
+        nargs = 1;
+    }
+
+    str_t final_output = str_init(initial_cap);
     bool success = false;
 
-    int status = lua_resume(co, 0);
+    int status = lua_resume(co, nargs);
 
     while (status == LUA_YIELD) {
         int top = lua_gettop(co);
@@ -319,7 +403,14 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
             if (lua_isstring(co, i)) {
                 size_t len;
                 const char *chunk = lua_tolstring(co, i, &len);
-                str_push(&final_output, chunk);
+                if (html)
+                    tmg_push_escaped(&final_output, chunk, len);
+                else
+                    str_push_len(&final_output, chunk, len);
+            } else {
+                tmg_raw_t *raw = tmg_raw_check(co, i);
+                if (raw)
+                    str_push_len(&final_output, raw->data, raw->len);
             }
         }
         lua_pop(co, top);
@@ -336,7 +427,9 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
         success = true;
     } else {
         /* Runtime error during coroutine streaming */
-        report_error_with_code(lua_tostring(co, -1), in_path, &lm, builder.data);
+        const char *msg = lua_tostring(co, -1);
+        tmg_set_error(err, msg);
+        report_error_with_code(msg, in_path, &lm, builder.data);
         lua_pop(L, 2); /* pop thread and function on error */
     }
 
@@ -354,7 +447,7 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
 bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
                 const char *sep, bool debug)
 {
-    if (!tmg_expand(L, in_path, sep, debug)) return false;
+    if (!tmg_expand(L, in_path, sep, debug, 0, false, NULL)) return false;
 
     const char *result = lua_tostring(L, -1);
     bool success = false;
@@ -371,9 +464,10 @@ bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
     return success;
 }
 
-bool tmg_render_string(lua_State *L, const char *in_path, const char *sep, bool debug)
+bool tmg_render_string(lua_State *L, const char *in_path, const char *sep, bool debug,
+                       bool html)
 {
-    return tmg_expand(L, in_path, sep, debug);
+    return tmg_expand(L, in_path, sep, debug, 0, html, NULL);
 }
 
 /* ---- TMG_LIB_PATH ---------------------------------------------------------- */
@@ -550,6 +644,9 @@ static int l_tmg_print(lua_State *L) {
     luaL_checkany(L, 1);
     lua_settop(L, 1);
 
+    if (tmg_raw_check(L, 1))
+        return lua_yield(L, 1);
+
     if (!lua_isstring(L, 1)) {
         if (luaL_callmeta(L, 1, "__tostring")) {
             /* objects with __tostring (e.g. latex nodes) print as that string */
@@ -561,6 +658,14 @@ static int l_tmg_print(lua_State *L) {
         }
     }
 
+    return lua_yield(L, 1);
+}
+
+static int l_tmg_print_raw(lua_State *L) {
+    size_t len = 0;
+    const char *s = luaL_checklstring(L, 1, &len);
+    lua_settop(L, 0);
+    tmg_push_raw(L, s, len);
     return lua_yield(L, 1);
 }
 
@@ -579,11 +684,63 @@ static int l_tmg_render_string(lua_State *L) {
     const char *in_path = luaL_checkstring(L, 1);
     const char *sep = resolve_sep(L, 2);
     bool debug = resolve_debug(L);
+    int data_idx = lua_isnoneornil(L, 3) ? 0 : 3;
+    bool html = false;
 
-    if (tmg_render_string(L, in_path, sep, debug)) {
+    if (lua_isboolean(L, 4)) {
+        html = lua_toboolean(L, 4) != 0;
+    } else if (lua_istable(L, 4)) {
+        lua_getfield(L, 4, "autoescape");
+        if (!lua_isnil(L, -1)) {
+            html = lua_toboolean(L, -1) != 0;
+        } else {
+            lua_pop(L, 1);
+            lua_getfield(L, 4, "html");
+            if (!lua_isnil(L, -1)) html = lua_toboolean(L, -1) != 0;
+        }
+        lua_pop(L, 1);
+    }
+
+    str_t err = str_init(64);
+    if (tmg_expand(L, in_path, sep, debug, data_idx, html, &err)) {
+        str_deinit(&err);
         return 1;
     }
     lua_pushnil(L);
+    lua_pushlstring(L, err.data, err.len);
+    str_deinit(&err);
+    return 2;
+}
+
+static int l_tmg_raw_tostring(lua_State *L) {
+    tmg_raw_t *raw = (tmg_raw_t *)lua_touserdata(L, 1);
+    if (!raw) return 0;
+    lua_pushlstring(L, raw->data, raw->len);
+    return 1;
+}
+
+static int l_tmg_escape_html(lua_State *L) {
+    tmg_raw_t *raw = tmg_raw_check(L, 1);
+    size_t len = 0;
+    const char *s = raw ? raw->data : luaL_checklstring(L, 1, &len);
+    if (raw) len = raw->len;
+
+    str_t out = str_init(len + 16);
+    tmg_push_escaped(&out, s, len);
+    lua_pushlstring(L, out.data, out.len);
+    str_deinit(&out);
+    return 1;
+}
+
+static int l_tmg_raw(lua_State *L) {
+    tmg_raw_t *raw = tmg_raw_check(L, 1);
+    if (raw) {
+        lua_pushvalue(L, 1);
+        return 1;
+    }
+    size_t len = 0;
+    const char *s = luaL_checklstring(L, 1, &len);
+    tmg_push_raw(L, s, len);
     return 1;
 }
 
@@ -591,11 +748,19 @@ static const luaL_Reg tmg_lib[] = {
     {"render", l_tmg_render},
     {"render_string", l_tmg_render_string},
     {"print", l_tmg_print},
+    {"print_raw", l_tmg_print_raw},
+    {"escape_html", l_tmg_escape_html},
+    {"raw", l_tmg_raw},
     {"find_lib", l_tmg_find_lib},
     {NULL, NULL}
 };
 
 int luaopen_tmg(lua_State *L) {
+    luaL_newmetatable(L, TMG_RAW_MT);
+    lua_pushcfunction(L, l_tmg_raw_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_pop(L, 1);
+
     luaL_newlib(L, tmg_lib);
     lua_getfield(L, LUA_REGISTRYINDEX, LIBDIRS_KEY);
     if (lua_istable(L, -1)) lua_setfield(L, -2, "lib_path");
@@ -642,6 +807,9 @@ int main(int argc, char **argv)
     luaL_requiref(L, "tmg", luaopen_tmg, 1);
     lua_pop(L, 1);
 
+    luaL_requiref(L, "http", luaopen_http, 1);
+    lua_pop(L, 1);
+
     int exit_code = EXIT_SUCCESS;
 
     lua_pushcfunction(L, msghandler);
@@ -662,8 +830,11 @@ int main(int argc, char **argv)
             fprintf(stderr, "ERR: %s\n", lua_tostring(L, -1));
             lua_pop(L, 1);
             exit_code = EXIT_FAILURE;
+        } else {
+            http_state_run(L);
         }
     }
+    http_state_deinit(L);
     lua_remove(L, msgh_idx);
 
     lua_close(L);

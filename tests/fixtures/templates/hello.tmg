@@ -1,0 +1,2 @@
+% local data = ... %
+Hello % tmg.print(data.name) %!
