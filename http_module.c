@@ -14,6 +14,7 @@ static void state_defaults(http_state_t *st) {
     st->cfg.max_headers = 100;
     st->cfg.max_url = 8192;
     st->cfg.max_static_size = 64 * 1024 * 1024;
+    st->cfg.max_ws_message = 10 * 1024 * 1024;
     st->cfg.header_timeout = 10;
     st->cfg.keepalive_timeout = 15;
     st->cfg.upload_dir = http_strdup("uploads");
@@ -55,6 +56,7 @@ static int l_http_listen(lua_State *L) {
     st->cfg.max_headers = 100;
     st->cfg.max_url = 8192;
     st->cfg.max_static_size = 64 * 1024 * 1024;
+    st->cfg.max_ws_message = 10 * 1024 * 1024;
     st->cfg.header_timeout = 10;
     st->cfg.keepalive_timeout = 15;
     st->cfg.upload_dir = http_strdup("uploads");
@@ -96,6 +98,10 @@ static int l_http_listen(lua_State *L) {
 
         lua_getfield(L, 1, "max_static_size");
         if (lua_isnumber(L, -1)) st->cfg.max_static_size = (size_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 1, "max_ws_message");
+        if (lua_isnumber(L, -1)) st->cfg.max_ws_message = (size_t)lua_tointeger(L, -1);
         lua_pop(L, 1);
 
         lua_getfield(L, 1, "header_timeout");
@@ -184,6 +190,7 @@ static int l_http_patch(lua_State *L) { return route_common(L, "PATCH"); }
 static int l_http_delete(lua_State *L) { return route_common(L, "DELETE"); }
 static int l_http_head(lua_State *L) { return route_common(L, "HEAD"); }
 static int l_http_options(lua_State *L) { return route_common(L, "OPTIONS"); }
+static int l_http_ws(lua_State *L) { return route_common(L, "WS"); }
 
 static int l_http_route(lua_State *L) {
     char *method = http_strdup(luaL_checkstring(L, 1));
@@ -242,6 +249,35 @@ int http_dispatch(http_conn_t *c) {
         return 0;
     }
     char *raw_path = http_strndup(url, pathlen);
+
+    if (llhttp_get_upgrade(&c->parser)) {
+        if (strcmp(method, "GET") != 0) {
+            http_conn_send_error(c, 400, "WebSocket upgrade requires GET");
+            str_deinit(&path);
+            free(raw_path);
+            return 0;
+        }
+        http_route_t *wsroute = http_route_match(st, "WS", path.data);
+        if (!wsroute) {
+            http_conn_send_error(c, 404, http_status_reason(404));
+            str_deinit(&path);
+            free(raw_path);
+            return 0;
+        }
+        if (!http_build_request(L, c, path.data, query, raw_path, wsroute)) {
+            http_conn_send_error(c, 400, http_status_reason(400));
+            str_deinit(&path);
+            free(raw_path);
+            return 0;
+        }
+
+        int base = lua_gettop(L); /* request table */
+        bool ok = http_ws_init(c, L, wsroute, base);
+        lua_settop(L, base - 1);
+        str_deinit(&path);
+        free(raw_path);
+        return ok ? 1 : 0;
+    }
 
     http_route_t *route = http_route_match(st, method, path.data);
     if (!route && strcmp(method, "HEAD") == 0)
@@ -310,6 +346,7 @@ static const luaL_Reg http_lib[] = {
     {"delete", l_http_delete},
     {"head", l_http_head},
     {"options", l_http_options},
+    {"ws", l_http_ws},
     {NULL, NULL}
 };
 

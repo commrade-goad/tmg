@@ -12,6 +12,7 @@ nothing is taken from the system package manager:
 
 * libuv `v1.53.0`
 * llhttp `release/v9.4.3` (pre-generated C, no Node needed)
+* wslay `release-1.1.1` (WebSocket framing)
 * LuaJIT in `LuaJIT-2.1/`
 
 ```sh
@@ -19,12 +20,12 @@ make deps          # optional: clone dependencies now
 make all -j$(nproc)
 ```
 
-`make` links `libluajit.a`, `libuv.a` and `libllhttp.a` statically into the
-`tmg` binary. libc remains dynamic; a fully static glibc binary is not
+`make` links `libluajit.a`, `libuv.a`, `libllhttp.a` and `libwslay.a`
+statically into the `tmg` binary. libc remains dynamic; a fully static glibc binary is not
 attempted. Verify with:
 
 ```sh
-ldd ./tmg           # no libuv/llhttp/luajit shared libraries
+ldd ./tmg           # no libuv/llhttp/wslay/luajit shared libraries
 ```
 
 ## Usage
@@ -127,6 +128,7 @@ http.listen {
     template_root = "templates",  -- res:render() is confined to this
     max_body = 10 * 1024 * 1024,
     max_static_size = 64 * 1024 * 1024,
+    max_ws_message = 10 * 1024 * 1024,
     header_timeout = 10,
     keepalive_timeout = 15,
 }
@@ -134,6 +136,31 @@ http.listen {
 
 Routes can also be registered with `http.route(method, pattern, handler)`;
 `http.put/patch/delete/head/options` mirror `get/post`.
+
+WebSocket routes use the same pattern syntax and receive the normal `req`
+table, including `req.params`:
+
+```lua
+http.ws("/ws/:room", function(ws, req)
+    local room = req.params.room
+    ws:on("message", function(ws, data, binary)
+        ws:send(room .. ":" .. data, binary)
+    end)
+    ws:on("close", function(ws, code, reason)
+        print("closed", code, reason)
+    end)
+end)
+```
+
+The handler is the open callback; it may call `ws:send` immediately or store
+`ws` for later use. `ws:send(data, binary)` sends a text frame by default,
+`ws:ping(data)` sends a ping, `ws:close(code, reason)` starts the close
+handshake, and `ws:is_open()` reports whether the connection is still open.
+Fragmented messages are reassembled, and ping/pong control frames are handled
+by wslay. Incoming messages are limited by `max_ws_message`. Subprotocol and
+extension negotiation is not implemented. A missing or invalid handshake gets
+`400`; an unsupported `Sec-WebSocket-Version` gets `426` with
+`Sec-WebSocket-Version: 13`.
 
 `req` contains `method`, `url`, `path`, `query`, `version`, `headers`,
 `cookies`, `body`, `params`, `query_params`, `form`, `files`, and

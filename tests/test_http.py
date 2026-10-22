@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+import base64
+import hashlib
 import http.client
 import os
 import socket
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -52,6 +55,82 @@ def raw_exchange(payload):
 def check(cond, msg):
     if not cond:
         raise AssertionError(msg)
+
+
+class WSClient:
+    def __init__(self, path):
+        self.sock = socket.create_connection((HOST, PORT), timeout=5)
+        self.buf = b""
+        self.key = base64.b64encode(os.urandom(16)).decode()
+        req = (
+            "GET %s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: %s\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+            % (path, HOST, PORT, self.key)
+        )
+        self.sock.sendall(req.encode())
+        head = self._recv_until(b"\r\n\r\n")
+        header = head[:-4]
+        self.status = int(header.split(b"\r\n", 1)[0].split()[1])
+        self.headers = {}
+        for line in header.split(b"\r\n")[1:]:
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                self.headers[k.strip().lower()] = v.strip()
+
+    def _recv_until(self, marker):
+        while marker not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise EOFError("websocket closed during handshake")
+            self.buf += chunk
+        idx = self.buf.index(marker) + len(marker)
+        out, self.buf = self.buf[:idx], self.buf[idx:]
+        return out
+
+    def _recv_exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise EOFError("websocket closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, payload, opcode=1, fin=True):
+        if isinstance(payload, str):
+            payload = payload.encode()
+        n = len(payload)
+        b0 = (0x80 if fin else 0) | opcode
+        if n < 126:
+            header = bytes([b0, 0x80 | n])
+        elif n < 65536:
+            header = bytes([b0, 0x80 | 126]) + struct.pack("!H", n)
+        else:
+            header = bytes([b0, 0x80 | 127]) + struct.pack("!Q", n)
+        mask = os.urandom(4)
+        masked = bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def recv(self):
+        h = self._recv_exact(2)
+        fin = bool(h[0] & 0x80)
+        opcode = h[0] & 0x0F
+        masked = bool(h[1] & 0x80)
+        n = h[1] & 0x7F
+        if n == 126:
+            n = struct.unpack("!H", self._recv_exact(2))[0]
+        elif n == 127:
+            n = struct.unpack("!Q", self._recv_exact(8))[0]
+        check(not masked, "server frames must not be masked")
+        payload = self._recv_exact(n)
+        return opcode, payload, fin
+
+    def close(self):
+        self.sock.close()
 
 
 def main():
@@ -238,6 +317,82 @@ def main():
         check(b" 200 " in idle.split(b"\r\n", 1)[0], "idle keep-alive request failed")
         check(b"Connection: keep-alive" in idle, "keep-alive header missing")
         check(elapsed >= 0.8 and elapsed < 5, "idle connection was not reaped")
+
+        hello = WSClient("/ws/hello")
+        check(hello.status == 101, "websocket hello handshake status")
+        opcode, payload, fin = hello.recv()
+        check(opcode == 1 and fin and payload == b"welcome",
+              "websocket initial send failed: %r" % payload)
+        WSClient.close(hello)
+
+        ws = WSClient("/ws/room42")
+        check(ws.status == 101, "websocket handshake status")
+        expected_accept = base64.b64encode(
+            hashlib.sha1((ws.key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+        )
+        check(ws.headers.get(b"sec-websocket-accept") == expected_accept,
+              "websocket accept key mismatch")
+        ws.send("hello")
+        opcode, payload, fin = ws.recv()
+        check(opcode == 1 and fin and payload == b"room42:txt:hello",
+              "websocket text echo failed: %r" % payload)
+        ws.send("frag", opcode=1, fin=False)
+        ws.send("mented", opcode=0, fin=True)
+        opcode, payload, fin = ws.recv()
+        check(opcode == 1 and fin and payload == b"room42:txt:fragmented",
+              "websocket fragmented message failed: %r" % payload)
+        ws.send(b"\x00\x01\xff", opcode=2)
+        opcode, payload, fin = ws.recv()
+        check(opcode == 2 and fin and payload == b"room42:bin:\x00\x01\xff",
+              "websocket binary echo failed: %r" % payload)
+        ws.send(b"ping", opcode=9)
+        opcode, payload, fin = ws.recv()
+        check(opcode == 10 and payload == b"ping", "websocket pong failed")
+        ws.send(struct.pack("!H", 1000) + b"bye", opcode=8)
+        opcode, payload, fin = ws.recv()
+        check(opcode == 8 and payload[:2] == struct.pack("!H", 1000),
+              "websocket close reply failed: %r" % payload)
+        check(ws.sock.recv(1) == b"", "websocket connection not closed")
+        WSClient.close(ws)
+
+        closer = WSClient("/ws/close-on-message")
+        closer.send("bye")
+        opcode, payload, fin = closer.recv()
+        check(opcode == 8 and payload[:2] == struct.pack("!H", 1000) and
+              payload[2:] == b"done",
+              "websocket server close failed: %r" % payload)
+        check(closer.sock.recv(1) == b"", "server-close connection stayed open")
+        WSClient.close(closer)
+
+        def ws_reject(version=None, key=True):
+            s = socket.create_connection((HOST, PORT), timeout=5)
+            headers = (
+                "GET /ws/room42 HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+            )
+            if key:
+                headers += "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            headers += "Sec-WebSocket-Version: %s\r\n\r\n" % (version or 13)
+            s.sendall(headers.encode())
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            return data
+
+        bad_version = ws_reject(version=12)
+        check(b" 426 " in bad_version.split(b"\r\n", 1)[0],
+              "websocket bad version should be 426")
+        check(b"Sec-WebSocket-Version: 13" in bad_version,
+              "websocket version header missing")
+        no_key = ws_reject(key=False)
+        check(b" 400 " in no_key.split(b"\r\n", 1)[0],
+              "websocket missing key should be 400")
 
         status, _, body = request("GET", "/shutdown")
         check(status == 200 and body == b"bye", "shutdown response failed")

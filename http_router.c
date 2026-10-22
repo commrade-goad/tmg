@@ -190,6 +190,7 @@ bool http_route_allowed(http_state_t *st, const char *path, str_t *allow) {
     bool any = false;
     for (size_t i = 0; i < st->nroutes; i++) {
         http_route_t *r = &st->routes[i];
+        if (strcmp(r->method, "WS") == 0) continue;
         if (!http_route_match_path(r, path)) continue;
         if (allow_has(allow, r->method)) continue;
         if (any) str_push(allow, ", ");

@@ -63,6 +63,26 @@ http.get("/escape-off", function(req, res)
     res:render("escape.tmg", { text = [[<b>"&'</b>]], raw = "<i>raw</i>" }, { autoescape = false })
 end)
 
+http.ws("/ws/:room", function(ws, req)
+    local room = req.params.room
+    ws:on("message", function(ws, data, binary)
+        ws:send(room .. ":" .. (binary and "bin:" or "txt:") .. data, binary)
+    end)
+    ws:on("close", function(ws, code, reason)
+        -- no application cleanup needed in this example
+    end)
+end)
+
+http.ws("/ws/hello", function(ws)
+    ws:send("welcome")
+end)
+
+http.ws("/ws/close-on-message", function(ws)
+    ws:on("message", function(ws)
+        ws:close(1000, "done")
+    end)
+end)
+
 http.get("/shutdown", function(req, res)
     res:send("bye")
     http.stop()

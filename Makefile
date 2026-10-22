@@ -1,16 +1,19 @@
 CC      ?= gcc
 CFLAGS  ?= -std=gnu11 -Wall -Wextra -O2 -g
-CPPFLAGS += -Ideps/libuv/include -Ideps/llhttp/include -ILuaJIT-2.1/src
+CPPFLAGS += -Ideps/libuv/include -Ideps/llhttp/include -Ideps/wslay/lib/includes -ILuaJIT-2.1/src
+CPPFLAGS += -DWSLAY_VERSION=\"1.1.1\"
 LDFLAGS += -Wl,-E
 
 LUAJIT_DIR  = LuaJIT-2.1
 UV_DIR      = deps/libuv
 LLHTTP_DIR  = deps/llhttp
+WSLAY_DIR   = deps/wslay
 
 LUAJIT_LIB  = $(LUAJIT_DIR)/src/libluajit.a
 UV_LIB      = $(UV_DIR)/build/libuv.a
 LLHTTP_LIB  = $(LLHTTP_DIR)/build/libllhttp.a
-LIB_ARCHIVES = $(LUAJIT_LIB) $(UV_LIB) $(LLHTTP_LIB)
+WSLAY_LIB   = $(WSLAY_DIR)/build/lib/libwslay.a
+LIB_ARCHIVES = $(LUAJIT_LIB) $(UV_LIB) $(LLHTTP_LIB) $(WSLAY_LIB)
 LIBS        = $(LIB_ARCHIVES) -pthread -ldl -lrt -lm
 
 SRC = $(wildcard *.c)
@@ -23,6 +26,8 @@ tmg: $(OBJ) $(LIB_ARCHIVES)
 
 %.o: %.c http.h str.h | deps
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+http_ws.o: $(WSLAY_LIB)
 
 .PHONY: deps
 deps:
@@ -42,6 +47,13 @@ $(LLHTTP_LIB): | deps
 		-DLLHTTP_BUILD_SHARED_LIBS=OFF -DLLHTTP_BUILD_STATIC_LIBS=ON
 	cmake --build $(LLHTTP_DIR)/build -j$$(nproc)
 
+$(WSLAY_LIB): | deps
+	cmake -S $(WSLAY_DIR) -B $(WSLAY_DIR)/build -DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DWSLAY_STATIC=ON \
+		-DWSLAY_SHARED=OFF -DWSLAY_EXAMPLES=OFF -DWSLAY_TESTS=OFF \
+		-DWSLAY_CONFIGURE_INSTALL=OFF
+	cmake --build $(WSLAY_DIR)/build -j$$(nproc)
+
 test: tmg
 	python3 tests/test_http.py
 	python3 tests/htmx_todo/test.py
@@ -50,6 +62,6 @@ clean:
 	rm -f $(OBJ) tmg
 
 distclean: clean
-	rm -rf $(UV_DIR)/build $(LLHTTP_DIR)/build
+	rm -rf $(UV_DIR)/build $(LLHTTP_DIR)/build $(WSLAY_DIR)/build
 
 .PHONY: all test clean distclean

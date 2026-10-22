@@ -14,3 +14,4 @@ clone() {
 
 clone libuv v1.53.0 https://github.com/libuv/libuv.git
 clone llhttp release/v9.4.3 https://github.com/nodejs/llhttp.git
+clone wslay release-1.1.1 https://github.com/tatsuhiro-t/wslay.git

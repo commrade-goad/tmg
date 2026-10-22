@@ -25,6 +25,7 @@ typedef struct {
 
 typedef struct http_conn http_conn_t;
 typedef struct http_state http_state_t;
+typedef struct http_ws http_ws_t;
 
 typedef struct {
     char *method;
@@ -48,6 +49,7 @@ typedef struct {
     size_t max_headers;
     size_t max_url;
     size_t max_static_size;
+    size_t max_ws_message;
     unsigned header_timeout;
     unsigned keepalive_timeout;
     char *upload_dir;
@@ -125,6 +127,9 @@ struct http_conn {
     size_t write_len;
     uv_write_t write_req;
     char remote[64];
+
+    /* websocket */
+    http_ws_t *ws;
 };
 
 /* util */
@@ -197,6 +202,13 @@ int http_state_start(lua_State *L, http_state_t *st);
 void http_state_stop(http_state_t *st);
 void http_state_run(lua_State *L);
 void http_state_deinit(lua_State *L);
+
+/* websocket */
+bool http_ws_init(http_conn_t *c, lua_State *L, http_route_t *route,
+                  int req_idx);
+void http_ws_feed(http_conn_t *c, const char *data, size_t len);
+void http_ws_disconnect(http_conn_t *c);
+void http_ws_cleanup(http_conn_t *c);
 
 /* module */
 int luaopen_http(lua_State *L);

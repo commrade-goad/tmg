@@ -174,6 +174,13 @@ static int on_message_complete(llhttp_t *p) {
     if (c->timer_init)
         uv_timer_stop(&c->timer);
 
+    if (llhttp_get_upgrade(p)) {
+        /* llhttp pauses with HPE_PAUSED_UPGRADE after this callback.  Dispatch
+         * from on_read so any bytes already read after the HTTP headers can be
+         * handed to wslay without going through the HTTP parser again. */
+        return 0;
+    }
+
     llhttp_pause(p);
     c->handler_running = true;
     http_dispatch(c);
@@ -210,6 +217,11 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
         free(buf->base);
         return;
     }
+    if (c->ws) {
+        http_ws_feed(c, buf->base, (size_t)nread);
+        free(buf->base);
+        return;
+    }
 
     c->keepalive_wait = false;
     if (c->timer_init) {
@@ -227,6 +239,30 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
         const char *pos = llhttp_get_error_pos(&c->parser);
         if (pos && pos < buf->base + nread) {
             /* pipelined data is not supported: finish this response, then close */
+            c->close_after_write = true;
+        }
+    } else if (err == HPE_PAUSED_UPGRADE) {
+        const char *pos = llhttp_get_error_pos(&c->parser);
+        size_t used = pos ? (size_t)(pos - buf->base) : (size_t)nread;
+        if (used > (size_t)nread) used = (size_t)nread;
+
+        c->handler_running = true;
+        http_dispatch(c);
+        c->handler_running = false;
+
+        if (c->ws) {
+            if (used < (size_t)nread)
+                http_ws_feed(c, buf->base + used, (size_t)nread - used);
+            if (!c->closing && !c->reading && !c->close_after_write) {
+                int rc = uv_read_start((uv_stream_t *)&c->handle, on_alloc, on_read);
+                if (rc != 0) {
+                    http_log("uv_read_start failed: %s", uv_strerror(rc));
+                    http_conn_close(c);
+                } else {
+                    c->reading = true;
+                }
+            }
+        } else {
             c->close_after_write = true;
         }
     } else {
@@ -320,6 +356,7 @@ static void conn_free(http_conn_t *c) {
         }
     }
 
+    http_ws_cleanup(c);
     free(c->method);
     free(c->version);
     free(c->write_buf);
@@ -337,6 +374,7 @@ void http_conn_close(http_conn_t *c) {
     if (!c || c->closing) return;
     c->closing = true;
     stop_reading(c);
+    http_ws_disconnect(c);
 
     if (c->timer_init && !c->timer_closing) {
         c->timer_closing = true;
