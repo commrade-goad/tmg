@@ -1,0 +1,13 @@
+% local todo = ... %
+<li id="todo-% tmg.print(todo.id) %" class="todo editing">
+  <form hx-put="/todos/% tmg.print(todo.id) %"
+        hx-target="#todo-list" hx-swap="innerHTML">
+    <input name="title" maxlength="200" required autofocus
+           value="% tmg.print(todo.title) %">
+    <button type="submit" class="save">Save</button>
+    <button type="button" class="cancel"
+            hx-get="/todos"
+            hx-target="#todo-list"
+            hx-swap="innerHTML">Cancel</button>
+  </form>
+</li>

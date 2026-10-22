@@ -1,0 +1,31 @@
+% local todos = ... %
+% if #todos == 0 then %
+<p class="empty">No todos yet. Add one above.</p>
+% else %
+<ul class="todo-list">
+% for _, todo in ipairs(todos) do %
+  % if todo.done then %
+  <li id="todo-% tmg.print(todo.id) %" class="todo done">
+  % else %
+  <li id="todo-% tmg.print(todo.id) %" class="todo">
+  % end %
+    <form hx-post="/todos/% tmg.print(todo.id) %/toggle"
+          hx-target="#todo-list" hx-swap="innerHTML">
+      <button type="submit" class="toggle">
+        % if todo.done then %Undo% else %Done% end %
+      </button>
+    </form>
+    <span class="title">% tmg.print(todo.title) %</span>
+    <button class="edit"
+            hx-get="/todos/% tmg.print(todo.id) %/edit"
+            hx-target="#todo-% tmg.print(todo.id) %"
+            hx-swap="outerHTML">Edit</button>
+    <button class="delete"
+            hx-delete="/todos/% tmg.print(todo.id) %"
+            hx-target="#todo-list"
+            hx-swap="innerHTML"
+            hx-confirm="Delete this todo?">Delete</button>
+  </li>
+% end %
+</ul>
+% end %

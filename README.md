@@ -153,11 +153,12 @@ saved under `upload_dir` and exposed as
 symlink-escape checks, directory paths serve `index.html`, and files larger
 than `max_static_size` are rejected. Range requests are not implemented.
 
-`res:render` HTML-escapes everything emitted by `tmg.print` by default,
-including values from `data`; use `tmg.raw(value)` for trusted HTML or pass
-`{ autoescape = false }` to disable it. `tmg.escape_html(value)` escapes
-manually. Rendered templates default to `text/html; charset=utf-8` when
-auto-escaping.
+`res:render` HTML-escapes dynamic values emitted by `tmg.print` by default,
+including values from `data`; literal template markup is untouched. Use
+`tmg.raw(value)` for trusted HTML or pass `{ autoescape = false }` to disable
+it. `tmg.escape_html(value)` returns an escaped string for direct use outside
+autoescaped output. Rendered templates default to
+`text/html; charset=utf-8` when auto-escaping.
 
 Every handler is invoked through a protected Lua call. A syntax/runtime
 error returns HTTP 500 to that request, logs a traceback, and leaves the
@@ -169,6 +170,17 @@ and idle keep-alive connections are closed. Sequential keep-alive is enabled
 when the client asks for it, and idle sockets are reaped after
 `keepalive_timeout` seconds. `tests/fixtures/http_app.lua` plus
 `tests/test_http.py` are a runnable example (`make test`).
+
+A session-scoped htmx Todo SPA lives in `tests/htmx_todo/`:
+
+```sh
+./tmg tests/htmx_todo/app.lua
+# open http://127.0.0.1:18081
+```
+
+It serves htmx locally, uses server-rendered fragments, and keeps CRUD state
+in memory per `todo_sid` cookie. `tests/htmx_todo/test.py` covers the full
+create/read/update/delete flow.
 
 ## Extra library paths
 Set `TMG_LIB_PATH` to a `:`-separated list of directories to make your own

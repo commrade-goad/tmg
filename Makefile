@@ -44,6 +44,7 @@ $(LLHTTP_LIB): | deps
 
 test: tmg
 	python3 tests/test_http.py
+	python3 tests/htmx_todo/test.py
 
 clean:
 	rm -f $(OBJ) tmg

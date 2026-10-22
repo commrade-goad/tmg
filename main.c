@@ -191,7 +191,7 @@ static void flush_text_buffer(str_t *builder, str_t *buffer, linemap_t *lm, int 
     while (start < buffer->len && buffer->data[start] == '\n')
         start++;
     if (start > 0) {
-        str_push(builder, "tmg.print(\"");
+        str_push(builder, "tmg.print_raw(\"");
         for (size_t i = 0; i < start; i++)
             str_push(builder, "\\n");
         str_push(builder, "\")\n");
@@ -224,7 +224,7 @@ static void flush_text_buffer(str_t *builder, str_t *buffer, linemap_t *lm, int 
     }
 
     /* Build opening long bracket: yield([==...==[ */
-    str_push(builder, "tmg.print([");
+    str_push(builder, "tmg.print_raw([");
     for (int i = 0; i < max_equals; i++) str_push_chr(builder, '=');
     str_push_chr(builder, '[');
 
@@ -661,6 +661,14 @@ static int l_tmg_print(lua_State *L) {
     return lua_yield(L, 1);
 }
 
+static int l_tmg_print_raw(lua_State *L) {
+    size_t len = 0;
+    const char *s = luaL_checklstring(L, 1, &len);
+    lua_settop(L, 0);
+    tmg_push_raw(L, s, len);
+    return lua_yield(L, 1);
+}
+
 static int l_tmg_render(lua_State *L) {
     const char *in_path  = luaL_checkstring(L, 1);
     const char *out_path = luaL_checkstring(L, 2);
@@ -740,6 +748,7 @@ static const luaL_Reg tmg_lib[] = {
     {"render", l_tmg_render},
     {"render_string", l_tmg_render_string},
     {"print", l_tmg_print},
+    {"print_raw", l_tmg_print_raw},
     {"escape_html", l_tmg_escape_html},
     {"raw", l_tmg_raw},
     {"find_lib", l_tmg_find_lib},
