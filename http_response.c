@@ -196,12 +196,30 @@ static int l_res_render(lua_State *L) {
         return luaL_error(L, "render: tmg.render_string is not available");
     }
 
+    bool autoescape = true;
+    if (lua_istable(L, 4)) {
+        lua_getfield(L, 4, "autoescape");
+        if (!lua_isnil(L, -1)) {
+            autoescape = lua_toboolean(L, -1) != 0;
+        } else {
+            lua_pop(L, 1);
+            lua_getfield(L, 4, "html");
+            if (!lua_isnil(L, -1)) autoescape = lua_toboolean(L, -1) != 0;
+        }
+        lua_pop(L, 1);
+    } else if (lua_isboolean(L, 4)) {
+        autoescape = lua_toboolean(L, 4) != 0;
+    }
+
     lua_pushlstring(L, full.data, full.len);
     lua_pushnil(L); /* default delimiter */
     if (lua_isnoneornil(L, 3)) lua_pushnil(L);
     else lua_pushvalue(L, 3);
+    lua_createtable(L, 0, 1);
+    lua_pushboolean(L, autoescape);
+    lua_setfield(L, -2, "autoescape");
 
-    if (lua_pcall(L, 3, 2, 0) != LUA_OK) {
+    if (lua_pcall(L, 4, 2, 0) != LUA_OK) {
         const char *err = lua_tostring(L, -1);
         str_deinit(&full);
         return luaL_error(L, "render: %s", err ? err : "failed");
@@ -216,6 +234,9 @@ static int l_res_render(lua_State *L) {
     size_t len = 0;
     const char *body = lua_tolstring(L, -2, &len);
     if (!body) body = "";
+    if (autoescape && !http_header_get(c->res_headers, c->nres_headers, "content-type"))
+        http_headers_add(&c->res_headers, &c->nres_headers, &c->cres_headers,
+                         "Content-Type", "text/html; charset=utf-8", true);
     str_clear(&c->res_body);
     str_push_len(&c->res_body, body, len);
     c->ended = true;

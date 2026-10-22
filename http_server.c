@@ -599,6 +599,11 @@ void http_state_deinit(lua_State *L) {
     st->nroutes = 0;
     st->croutes = 0;
 
+    http_statics_free(st->statics, st->nstatics);
+    st->statics = NULL;
+    st->nstatics = 0;
+    st->cstatics = 0;
+
     free(st->cfg.host);
     free(st->cfg.upload_dir);
     free(st->cfg.template_root);

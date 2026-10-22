@@ -64,7 +64,10 @@ Hello % tmg.print(data.name) %!
 
 `tmg.render_string(path, sep, data)` returns the rendered string, or
 `nil, error`. The optional `data` value is passed to the template chunk as
-its vararg, so `local data = ...` works without touching globals.
+its vararg, so `local data = ...` works without touching globals. A fourth
+argument, `{ autoescape = true }`, HTML-escapes values emitted by
+`tmg.print`; `tmg.raw(value)` bypasses escaping. CLI `tmg.render(...)` does
+not auto-escape, so LaTeX and other plain-text templates keep working.
 
 Because rendering happens in the same Lua state your build script is
 running in, anything the script `require`s or sets as a global is visible
@@ -101,6 +104,9 @@ http.get("/", function(req, res)
     res:send("hello")
 end)
 
+-- serve GET/HEAD under /assets from ./public; routes still take precedence
+http.static("/assets", "public")
+
 -- :id becomes req.params.id
 http.get("/tu/requests/:id", function(req, res)
     res:render("request.tmg", { id = req.params.id })
@@ -120,6 +126,7 @@ http.listen {
     upload_dir = "uploads",       -- multipart file destination
     template_root = "templates",  -- res:render() is confined to this
     max_body = 10 * 1024 * 1024,
+    max_static_size = 64 * 1024 * 1024,
     header_timeout = 10,
     keepalive_timeout = 15,
 }
@@ -137,9 +144,20 @@ saved under `upload_dir` and exposed as
 
 `res` methods: `status(code)`, `header(name, value)`, `send(body)`,
 `json(value)`, `html(body)`, `redirect(location, status)`,
-`cookie(name, value, opts)`, `render(template, data)`, `close()`.
+`cookie(name, value, opts)`, `render(template, data, opts)`, `close()`.
 `res:cookie` defaults to `HttpOnly; SameSite=Lax; Path=/`; options include
 `path`, `domain`, `max_age`, `expires`, `secure`, `httponly`, `samesite`.
+
+`http.static(prefix, root)` maps a URL prefix to a document root. Only
+`GET` and `HEAD` are served, paths are resolved under `root` with `..` and
+symlink-escape checks, directory paths serve `index.html`, and files larger
+than `max_static_size` are rejected. Range requests are not implemented.
+
+`res:render` HTML-escapes everything emitted by `tmg.print` by default,
+including values from `data`; use `tmg.raw(value)` for trusted HTML or pass
+`{ autoescape = false }` to disable it. `tmg.escape_html(value)` escapes
+manually. Rendered templates default to `text/html; charset=utf-8` when
+auto-escaping.
 
 Every handler is invoked through a protected Lua call. A syntax/runtime
 error returns HTTP 500 to that request, logs a traceback, and leaves the
@@ -147,8 +165,10 @@ server loop running. Set `debug = true` in `http.listen` to include the Lua
 error text in the 500 body.
 
 `http.stop()` closes the listener and signal handles; active responses finish
-and idle keep-alive connections are closed. `tests/fixtures/http_app.lua`
-plus `tests/test_http.py` are a runnable example (`make test`).
+and idle keep-alive connections are closed. Sequential keep-alive is enabled
+when the client asks for it, and idle sockets are reaped after
+`keepalive_timeout` seconds. `tests/fixtures/http_app.lua` plus
+`tests/test_http.py` are a runnable example (`make test`).
 
 ## Extra library paths
 Set `TMG_LIB_PATH` to a `:`-separated list of directories to make your own

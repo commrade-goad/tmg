@@ -121,7 +121,43 @@ def main():
             check(f.read() == file_data, "uploaded file contents mismatch")
 
         status, _, body = request("GET", "/render")
-        check(status == 200 and body == b"Hello TMG!\n", "template render failed: " + repr(body))
+        check(status == 200 and body == b"\nHello TMG!\n", "template render failed: " + repr(body))
+
+        status, headers, body = request("GET", "/escape")
+        expected = b"&lt;b&gt;&quot;&amp;&#39;&lt;/b&gt;|<i>raw</i>\n"
+        check(status == 200 and body == expected,
+              "html autoescape failed: " + repr(body))
+        check("text/html" in headers.get("content-type", ""),
+              "html autoescape content type")
+
+        status, _, body = request("GET", "/escape-off")
+        check(status == 200 and body == b"<b>\"&'</b>|<i>raw</i>\n",
+              "autoescape opt-out failed: " + repr(body))
+
+        status, headers, body = request("GET", "/static/assets/app.css")
+        check(status == 200 and body == b"body { color: red; }\n",
+              "static css failed: " + repr(body))
+        check("text/css" in headers.get("content-type", ""),
+              "static css content type")
+        check(headers.get("x-content-type-options") == "nosniff",
+              "static nosniff header")
+
+        status, headers, body = request("HEAD", "/static/assets/app.css")
+        check(status == 200 and body == b"",
+              "static HEAD failed")
+        check(headers.get("content-length") == str(len(b"body { color: red; }\n")),
+              "static HEAD content-length")
+
+        status, _, body = request("GET", "/static/assets/")
+        check(status == 200 and body == b"<h1>assets</h1>\n",
+              "static directory index failed: " + repr(body))
+
+        status, _, _ = request("GET", "/static/%2e%2e/secret.txt")
+        check(status == 404, "static traversal should be blocked")
+
+        status, headers, _ = request("POST", "/static/assets/app.css")
+        check(status == 405 and "GET" in headers.get("allow", ""),
+              "static method should be 405")
 
         status, _, _ = request("GET", "/boom")
         check(status == 500, "handler error should be 500")
@@ -193,6 +229,15 @@ def main():
         conn.close()
         check(r1.status == 200 and r2.status == 200 and b1 == b2 == b"ok",
               "keep-alive reuse failed")
+
+        start = time.time()
+        idle = raw_exchange(
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+        )
+        elapsed = time.time() - start
+        check(b" 200 " in idle.split(b"\r\n", 1)[0], "idle keep-alive request failed")
+        check(b"Connection: keep-alive" in idle, "keep-alive header missing")
+        check(elapsed >= 0.8 and elapsed < 5, "idle connection was not reaped")
 
         status, _, body = request("GET", "/shutdown")
         check(status == 200 and body == b"bye", "shutdown response failed")

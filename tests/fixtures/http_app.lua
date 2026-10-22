@@ -55,15 +55,27 @@ http.get("/render", function(req, res)
     res:render("hello.tmg", { name = "TMG" })
 end)
 
+http.get("/escape", function(req, res)
+    res:render("escape.tmg", { text = [[<b>"&'</b>]], raw = "<i>raw</i>" })
+end)
+
+http.get("/escape-off", function(req, res)
+    res:render("escape.tmg", { text = [[<b>"&'</b>]], raw = "<i>raw</i>" }, { autoescape = false })
+end)
+
 http.get("/shutdown", function(req, res)
     res:send("bye")
     http.stop()
 end)
 
+http.static("/static", "tests/fixtures/public")
+
 local ok = http.listen({
     host = "127.0.0.1",
     port = 18080,
     max_body = 2 * 1024 * 1024,
+    max_static_size = 1024 * 1024,
+    keepalive_timeout = 1,
     upload_dir = "tests/uploads",
     template_root = "tests/fixtures/templates",
     debug = true,

@@ -36,12 +36,18 @@ typedef struct {
 } http_route_t;
 
 typedef struct {
+    char *prefix;
+    char *root;
+} http_static_t;
+
+typedef struct {
     char *host;
     int port;
     size_t max_body;
     size_t max_header_bytes;
     size_t max_headers;
     size_t max_url;
+    size_t max_static_size;
     unsigned header_timeout;
     unsigned keepalive_timeout;
     char *upload_dir;
@@ -64,6 +70,9 @@ struct http_state {
     http_route_t *routes;
     size_t nroutes;
     size_t croutes;
+    http_static_t *statics;
+    size_t nstatics;
+    size_t cstatics;
     http_conn_t *conns;
     lua_State *L;
 };
@@ -147,6 +156,12 @@ bool http_multipart_parse(http_conn_t *c, lua_State *L, int form_idx,
 
 /* json */
 bool http_json_encode(lua_State *L, int idx, str_t *out, int depth);
+
+/* static files */
+bool http_static_add(http_state_t *st, const char *prefix, const char *root,
+                     str_t *err);
+bool http_static_serve(http_conn_t *c, const char *method, const char *path);
+void http_statics_free(http_static_t *statics, size_t n);
 
 /* router */
 bool http_route_add(http_state_t *st, const char *method, const char *pattern,

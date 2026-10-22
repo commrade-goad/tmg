@@ -13,6 +13,7 @@ static void state_defaults(http_state_t *st) {
     st->cfg.max_header_bytes = 64 * 1024;
     st->cfg.max_headers = 100;
     st->cfg.max_url = 8192;
+    st->cfg.max_static_size = 64 * 1024 * 1024;
     st->cfg.header_timeout = 10;
     st->cfg.keepalive_timeout = 15;
     st->cfg.upload_dir = http_strdup("uploads");
@@ -53,6 +54,7 @@ static int l_http_listen(lua_State *L) {
     st->cfg.max_header_bytes = 64 * 1024;
     st->cfg.max_headers = 100;
     st->cfg.max_url = 8192;
+    st->cfg.max_static_size = 64 * 1024 * 1024;
     st->cfg.header_timeout = 10;
     st->cfg.keepalive_timeout = 15;
     st->cfg.upload_dir = http_strdup("uploads");
@@ -90,6 +92,10 @@ static int l_http_listen(lua_State *L) {
 
         lua_getfield(L, 1, "max_url");
         if (lua_isnumber(L, -1)) st->cfg.max_url = (size_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 1, "max_static_size");
+        if (lua_isnumber(L, -1)) st->cfg.max_static_size = (size_t)lua_tointeger(L, -1);
         lua_pop(L, 1);
 
         lua_getfield(L, 1, "header_timeout");
@@ -134,6 +140,21 @@ static int l_http_listen(lua_State *L) {
 static int l_http_stop(lua_State *L) {
     http_state_t *st = ensure_state(L);
     http_state_stop(st);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_http_static(lua_State *L) {
+    http_state_t *st = ensure_state(L);
+    const char *prefix = luaL_checkstring(L, 1);
+    const char *root = luaL_checkstring(L, 2);
+    str_t err = str_init(64);
+    if (!http_static_add(st, prefix, root, &err)) {
+        const char *msg = err.len ? err.data : "invalid static mount";
+        str_deinit(&err);
+        return luaL_error(L, "http.static: %s", msg);
+    }
+    str_deinit(&err);
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -227,6 +248,11 @@ int http_dispatch(http_conn_t *c) {
         route = http_route_match(st, "GET", path.data);
 
     if (!route) {
+        if (http_static_serve(c, method, path.data)) {
+            str_deinit(&path);
+            free(raw_path);
+            return 0;
+        }
         str_t allow = str_init(32);
         bool is_405 = http_route_allowed(st, path.data, &allow);
         send_simple(c, is_405 ? 405 : 404, is_405 ? allow.data : NULL);
@@ -275,6 +301,7 @@ int http_dispatch(http_conn_t *c) {
 static const luaL_Reg http_lib[] = {
     {"listen", l_http_listen},
     {"stop", l_http_stop},
+    {"static", l_http_static},
     {"route", l_http_route},
     {"get", l_http_get},
     {"post", l_http_post},
