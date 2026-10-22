@@ -1,7 +1,9 @@
 #include "http.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 
@@ -15,7 +17,11 @@ static void state_defaults(http_state_t *st) {
     st->cfg.max_url = 8192;
     st->cfg.max_static_size = 64 * 1024 * 1024;
     st->cfg.max_ws_message = 10 * 1024 * 1024;
+    st->cfg.max_response = 10 * 1024 * 1024;
     st->cfg.header_timeout = 10;
+    st->cfg.body_timeout = 15;
+    st->cfg.handler_timeout = 30;
+    st->cfg.write_timeout = 30;
     st->cfg.keepalive_timeout = 15;
     st->cfg.upload_dir = http_strdup("uploads");
     st->cfg.template_root = http_strdup(".");
@@ -57,11 +63,42 @@ static int l_http_listen(lua_State *L) {
     st->cfg.max_url = 8192;
     st->cfg.max_static_size = 64 * 1024 * 1024;
     st->cfg.max_ws_message = 10 * 1024 * 1024;
+    st->cfg.max_response = 10 * 1024 * 1024;
     st->cfg.header_timeout = 10;
+    st->cfg.body_timeout = 15;
+    st->cfg.handler_timeout = 30;
+    st->cfg.write_timeout = 30;
     st->cfg.keepalive_timeout = 15;
     st->cfg.upload_dir = http_strdup("uploads");
     st->cfg.template_root = http_strdup(".");
     st->cfg.debug = false;
+
+    #define READ_SIZE_FIELD(name, target) do { \
+        lua_getfield(L, 1, name); \
+        if (!lua_isnil(L, -1)) { \
+            lua_Integer v = luaL_checkinteger(L, -1); \
+            if (v < 0) \
+                return luaL_error(L, "http.listen: %s must be >= 0", name); \
+            size_t sv = (size_t)v; \
+            if ((lua_Integer)sv != v) \
+                return luaL_error(L, "http.listen: %s is too large", name); \
+            target = sv; \
+        } \
+        lua_pop(L, 1); \
+    } while (0)
+    #define READ_TIMEOUT_FIELD(name, target) do { \
+        lua_getfield(L, 1, name); \
+        if (!lua_isnil(L, -1)) { \
+            lua_Integer v = luaL_checkinteger(L, -1); \
+            if (v < 0) \
+                return luaL_error(L, "http.listen: %s must be >= 0", name); \
+            unsigned uv = (unsigned)v; \
+            if ((lua_Integer)uv != v) \
+                return luaL_error(L, "http.listen: %s is too large", name); \
+            target = uv; \
+        } \
+        lua_pop(L, 1); \
+    } while (0)
 
     if (lua_istable(L, 1)) {
         lua_getfield(L, 1, "host");
@@ -80,37 +117,18 @@ static int l_http_listen(lua_State *L) {
         }
         lua_pop(L, 1);
 
-        lua_getfield(L, 1, "max_body");
-        if (lua_isnumber(L, -1)) st->cfg.max_body = (size_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 1, "max_header_bytes");
-        if (lua_isnumber(L, -1)) st->cfg.max_header_bytes = (size_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 1, "max_headers");
-        if (lua_isnumber(L, -1)) st->cfg.max_headers = (size_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 1, "max_url");
-        if (lua_isnumber(L, -1)) st->cfg.max_url = (size_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 1, "max_static_size");
-        if (lua_isnumber(L, -1)) st->cfg.max_static_size = (size_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 1, "max_ws_message");
-        if (lua_isnumber(L, -1)) st->cfg.max_ws_message = (size_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 1, "header_timeout");
-        if (lua_isnumber(L, -1)) st->cfg.header_timeout = (unsigned)lua_tointeger(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 1, "keepalive_timeout");
-        if (lua_isnumber(L, -1)) st->cfg.keepalive_timeout = (unsigned)lua_tointeger(L, -1);
-        lua_pop(L, 1);
+        READ_SIZE_FIELD("max_body", st->cfg.max_body);
+        READ_SIZE_FIELD("max_header_bytes", st->cfg.max_header_bytes);
+        READ_SIZE_FIELD("max_headers", st->cfg.max_headers);
+        READ_SIZE_FIELD("max_url", st->cfg.max_url);
+        READ_SIZE_FIELD("max_static_size", st->cfg.max_static_size);
+        READ_SIZE_FIELD("max_ws_message", st->cfg.max_ws_message);
+        READ_SIZE_FIELD("max_response", st->cfg.max_response);
+        READ_TIMEOUT_FIELD("header_timeout", st->cfg.header_timeout);
+        READ_TIMEOUT_FIELD("body_timeout", st->cfg.body_timeout);
+        READ_TIMEOUT_FIELD("handler_timeout", st->cfg.handler_timeout);
+        READ_TIMEOUT_FIELD("write_timeout", st->cfg.write_timeout);
+        READ_TIMEOUT_FIELD("keepalive_timeout", st->cfg.keepalive_timeout);
 
         lua_getfield(L, 1, "upload_dir");
         if (lua_isstring(L, -1)) {
@@ -134,6 +152,10 @@ static int l_http_listen(lua_State *L) {
     if (st->cfg.max_header_bytes == 0) st->cfg.max_header_bytes = 64 * 1024;
     if (st->cfg.max_headers == 0) st->cfg.max_headers = 100;
     if (st->cfg.max_url == 0) st->cfg.max_url = 8192;
+    if (st->cfg.max_response == 0) st->cfg.max_response = 10 * 1024 * 1024;
+
+    #undef READ_SIZE_FIELD
+    #undef READ_TIMEOUT_FIELD
 
     int rc = http_state_start(L, st);
     if (rc != 0)
@@ -320,12 +342,14 @@ int http_dispatch(http_conn_t *c) {
         http_log("handler error: %s", emsg.len ? emsg.data : "(non-string error)");
         lua_settop(L, base - 1);
         http_response_reset(c);
+        http_response_detach_all(c);
         const char *body = st->cfg.debug && emsg.len ? emsg.data : "Internal Server Error";
         http_conn_send_error(c, 500, body);
         str_deinit(&emsg);
     } else {
         lua_settop(L, base - 1);
         if (!c->ended) c->ended = true;
+        http_response_detach_all(c);
         http_conn_send_response(c);
     }
 

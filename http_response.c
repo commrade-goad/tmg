@@ -2,18 +2,30 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
-typedef struct {
+struct http_res_ud {
     http_conn_t *conn;
-} http_res_t;
+    struct http_res_ud *next;
+    unsigned long generation;
+};
+
+static bool response_body_limit(http_conn_t *c, size_t len) {
+    size_t max = c->state ? c->state->cfg.max_response : 0;
+    return max == 0 || len <= max;
+}
 
 static http_conn_t *check_conn(lua_State *L) {
-    http_res_t *r = (http_res_t *)luaL_checkudata(L, 1, HTTP_RES_MT);
+    http_res_ud_t *r = (http_res_ud_t *)luaL_checkudata(L, 1, HTTP_RES_MT);
     if (!r->conn) luaL_error(L, "response is detached");
+    if (r->generation != r->conn->req_generation)
+        luaL_error(L, "response is detached");
+    if (r->conn->closing)
+        luaL_error(L, "response is detached");
     return r->conn;
 }
 
@@ -82,6 +94,8 @@ static int l_res_send(lua_State *L) {
     if (c->ended) return luaL_error(L, "response already sent");
     size_t len = 0;
     const char *body = lua_isnoneornil(L, 2) ? "" : luaL_checklstring(L, 2, &len);
+    if (!response_body_limit(c, len))
+        return luaL_error(L, "response exceeds max_response");
     str_clear(&c->res_body);
     str_push_len(&c->res_body, body, len);
     c->ended = true;
@@ -103,6 +117,10 @@ static int l_res_json(lua_State *L) {
     if (!http_header_get(c->res_headers, c->nres_headers, "content-type"))
         http_headers_add(&c->res_headers, &c->nres_headers, &c->cres_headers,
                          "Content-Type", "application/json; charset=utf-8", true);
+    if (!response_body_limit(c, out.len)) {
+        str_deinit(&out);
+        return luaL_error(L, "response exceeds max_response");
+    }
 
     str_clear(&c->res_body);
     str_push_len(&c->res_body, out.data, out.len);
@@ -117,6 +135,8 @@ static int l_res_html(lua_State *L) {
     if (c->ended) return luaL_error(L, "response already sent");
     size_t len = 0;
     const char *body = luaL_checklstring(L, 2, &len);
+    if (!response_body_limit(c, len))
+        return luaL_error(L, "response exceeds max_response");
 
     if (!http_header_get(c->res_headers, c->nres_headers, "content-type"))
         http_headers_add(&c->res_headers, &c->nres_headers, &c->cres_headers,
@@ -234,6 +254,8 @@ static int l_res_render(lua_State *L) {
     size_t len = 0;
     const char *body = lua_tolstring(L, -2, &len);
     if (!body) body = "";
+    if (!response_body_limit(c, len))
+        return luaL_error(L, "response exceeds max_response");
     if (autoescape && !http_header_get(c->res_headers, c->nres_headers, "content-type"))
         http_headers_add(&c->res_headers, &c->nres_headers, &c->cres_headers,
                          "Content-Type", "text/html; charset=utf-8", true);
@@ -278,11 +300,27 @@ static void ensure_res_metatable(lua_State *L) {
 
 int http_response_push(lua_State *L, http_conn_t *c) {
     ensure_res_metatable(L);
-    http_res_t *r = (http_res_t *)lua_newuserdata(L, sizeof(http_res_t));
+    http_res_ud_t *r = (http_res_ud_t *)lua_newuserdata(L, sizeof(http_res_ud_t));
     r->conn = c;
+    r->generation = c ? c->req_generation : 0;
+    r->next = c ? c->responses : NULL;
+    if (c) c->responses = r;
     luaL_getmetatable(L, HTTP_RES_MT);
     lua_setmetatable(L, -2);
     return 1;
+}
+
+void http_response_detach_all(http_conn_t *c) {
+    if (!c) return;
+    http_res_ud_t *r = c->responses;
+    while (r) {
+        http_res_ud_t *next = r->next;
+        r->conn = NULL;
+        r->generation = 0;
+        r->next = NULL;
+        r = next;
+    }
+    c->responses = NULL;
 }
 
 void http_response_reset(http_conn_t *c) {
@@ -308,6 +346,10 @@ bool http_conn_send_response(http_conn_t *c) {
     int status = c->status ? c->status : 200;
     bool head = c->method && strcmp(c->method, "HEAD") == 0;
     bool no_body = (status == 204 || status == 304);
+    if (!response_body_limit(c, c->res_body.len)) {
+        http_conn_send_error(c, 500, "response exceeds max_response");
+        return false;
+    }
 
     str_t out = str_init(512 + c->res_body.len);
     char line[128];
@@ -350,12 +392,25 @@ bool http_conn_send_response(http_conn_t *c) {
     if (!no_body && !head)
         str_push_len(&out, c->res_body.data ? c->res_body.data : "",
                      c->res_body.len);
+    if (!response_body_limit(c, out.len)) {
+        str_deinit(&out);
+        http_conn_send_error(c, 500, "response exceeds max_response");
+        return false;
+    }
 
     c->write_buf = out.data;
     c->write_len = out.len;
     c->writing = true;
     c->write_req.data = c;
+    http_conn_timer_set(c, HTTP_TIMER_WRITE, c->state->cfg.write_timeout);
 
+    if (c->write_len > UINT_MAX) {
+        free(c->write_buf);
+        c->write_buf = NULL;
+        c->writing = false;
+        http_conn_send_error(c, 500, "response too large");
+        return false;
+    }
     uv_buf_t buf = uv_buf_init(c->write_buf, (unsigned int)c->write_len);
     int rc = uv_write(&c->write_req, (uv_stream_t *)&c->handle, &buf, 1,
                       http_conn_write_cb);

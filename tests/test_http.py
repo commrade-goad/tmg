@@ -213,6 +213,15 @@ def main():
         check(status == 200 and body == b"<b>\"&'</b>|<i>raw</i>\n",
               "autoescape opt-out failed: " + repr(body))
 
+        status, _, body = request("GET", "/stash-response")
+        check(status == 200 and body == b"stored", "stash response failed")
+        status, _, body = request("GET", "/use-stale-response")
+        check(status == 200 and b"response is detached" in body,
+              "stale response should fail deterministically: " + repr(body))
+
+        status, _, _ = request("GET", "/too-large-response")
+        check(status == 500, "oversized response should fail with 500")
+
         status, headers, body = request("GET", "/static/assets/app.css")
         check(status == 200 and body == b"body { color: red; }\n",
               "static css failed: " + repr(body))
@@ -398,6 +407,18 @@ def main():
         check(status == 200 and body == b"bye", "shutdown response failed")
         proc.wait(timeout=5)
         check(proc.returncode == 0, "server exited with %s" % proc.returncode)
+
+        bad = subprocess.run(
+            [os.path.join(ROOT, "tmg"), os.path.join("tests", "fixtures", "http_bad_config.lua")],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+        check(bad.returncode != 0, "invalid config should fail")
+        check("max_body must be >= 0" in bad.stderr,
+              "invalid config error message missing: " + bad.stderr)
 
         print("ok: all HTTP tests passed")
     finally:

@@ -129,7 +129,11 @@ http.listen {
     max_body = 10 * 1024 * 1024,
     max_static_size = 64 * 1024 * 1024,
     max_ws_message = 10 * 1024 * 1024,
+    max_response = 10 * 1024 * 1024,
     header_timeout = 10,
+    body_timeout = 15,
+    handler_timeout = 30,
+    write_timeout = 30,
     keepalive_timeout = 15,
 }
 ```
@@ -195,7 +199,12 @@ error text in the 500 body.
 `http.stop()` closes the listener and signal handles; active responses finish
 and idle keep-alive connections are closed. Sequential keep-alive is enabled
 when the client asks for it, and idle sockets are reaped after
-`keepalive_timeout` seconds. `tests/fixtures/http_app.lua` plus
+`keepalive_timeout` seconds. `header_timeout` applies to request headers,
+`body_timeout` applies while receiving a request body (falls back to
+`header_timeout` when unset), `handler_timeout` applies while Lua handlers are
+running, and `write_timeout` applies while a response write is in flight.
+`max_response` is enforced for `send/json/html/render`, static files, and the
+final serialized HTTP response. `tests/fixtures/http_app.lua` plus
 `tests/test_http.py` are a runnable example (`make test`).
 
 A session-scoped htmx Todo SPA lives in `tests/htmx_todo/`:

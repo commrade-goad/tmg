@@ -17,6 +17,12 @@
 #define HTTP_REQ_MT "tmg.http.request"
 #define HTTP_SERVER_NAME "tmg"
 #define HTTP_READ_CHUNK 16384
+#define HTTP_TIMER_NONE 0u
+#define HTTP_TIMER_HEADER 1u
+#define HTTP_TIMER_BODY 2u
+#define HTTP_TIMER_HANDLER 3u
+#define HTTP_TIMER_WRITE 4u
+#define HTTP_TIMER_KEEPALIVE 5u
 
 typedef struct {
     char *name;
@@ -26,6 +32,7 @@ typedef struct {
 typedef struct http_conn http_conn_t;
 typedef struct http_state http_state_t;
 typedef struct http_ws http_ws_t;
+typedef struct http_res_ud http_res_ud_t;
 
 typedef struct {
     char *method;
@@ -50,7 +57,11 @@ typedef struct {
     size_t max_url;
     size_t max_static_size;
     size_t max_ws_message;
+    size_t max_response;
     unsigned header_timeout;
+    unsigned body_timeout;
+    unsigned handler_timeout;
+    unsigned write_timeout;
     unsigned keepalive_timeout;
     char *upload_dir;
     char *template_root;
@@ -123,10 +134,14 @@ struct http_conn {
     bool writing;
     bool closing;
     bool handler_running;
+    bool timed_out;
     char *write_buf;
     size_t write_len;
     uv_write_t write_req;
     char remote[64];
+    http_res_ud_t *responses;
+    unsigned long req_generation;
+    unsigned timer_mode;
 
     /* websocket */
     http_ws_t *ws;
@@ -187,6 +202,7 @@ int http_request_push_metatable(lua_State *L);
 
 /* response */
 int http_response_push(lua_State *L, http_conn_t *c);
+void http_response_detach_all(http_conn_t *c);
 void http_response_reset(http_conn_t *c);
 bool http_conn_send_response(http_conn_t *c);
 void http_conn_send_error(http_conn_t *c, int status, const char *msg);
@@ -195,6 +211,7 @@ void http_conn_send_error(http_conn_t *c, int status, const char *msg);
 void http_conn_close(http_conn_t *c);
 void http_conn_reset_request(http_conn_t *c);
 void http_conn_write_cb(uv_write_t *req, int status);
+void http_conn_timer_set(http_conn_t *c, unsigned mode, unsigned timeout_secs);
 
 /* server */
 http_state_t *http_state_get(lua_State *L);

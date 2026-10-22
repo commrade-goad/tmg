@@ -30,6 +30,8 @@ struct http_ws {
     bool in_open_handler;
     bool in_recv;
     bool close_notified;
+    bool cleanup_pending;
+    bool refs_released;
     char *write_buf;
     uv_write_t write_req;
 };
@@ -44,6 +46,8 @@ typedef struct {
 static void ws_flush(http_ws_t *ws);
 static void ws_notify_close(http_ws_t *ws, uint16_t code, const char *reason,
                             size_t rlen);
+static void ws_release_refs(http_ws_t *ws);
+static void ws_cleanup_now(http_ws_t *ws);
 
 static uint32_t rol32(uint32_t x, unsigned n) {
     return (x << n) | (x >> (32 - n));
@@ -268,6 +272,33 @@ static void ws_free_resources(http_ws_t *ws) {
     ws->write_buf = NULL;
 }
 
+static void ws_release_refs(http_ws_t *ws) {
+    if (!ws || ws->refs_released) return;
+    ws->refs_released = true;
+    lua_State *L = ws->L;
+    ws->L = NULL;
+    if (!L) return;
+    if (ws->on_message_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, ws->on_message_ref);
+        ws->on_message_ref = LUA_NOREF;
+    }
+    if (ws->on_close_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, ws->on_close_ref);
+        ws->on_close_ref = LUA_NOREF;
+    }
+    if (ws->self_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, ws->self_ref);
+        ws->self_ref = LUA_NOREF;
+    }
+}
+
+static void ws_cleanup_now(http_ws_t *ws) {
+    if (!ws) return;
+    ws->cleanup_pending = false;
+    ws_free_resources(ws);
+    ws_release_refs(ws);
+}
+
 static void ws_compact_in(http_ws_t *ws) {
     if (!ws || ws->in_pos == 0) return;
     if (ws->in_pos >= ws->in.len) {
@@ -315,6 +346,11 @@ static void ws_write_cb(uv_write_t *req, int status) {
     ws->writing = false;
     free(ws->write_buf);
     ws->write_buf = NULL;
+
+    if (ws->cleanup_pending) {
+        ws_cleanup_now(ws);
+        return;
+    }
 
     if (!c) return;
     if (status < 0) {
@@ -498,24 +534,11 @@ void http_ws_cleanup(http_conn_t *c) {
     c->ws = NULL;
     ws->conn = NULL;
     ws->closing = true;
-
-    ws_free_resources(ws);
-
-    lua_State *L = ws->L;
-    ws->L = NULL;
-    if (!L) return;
-    if (ws->on_message_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, ws->on_message_ref);
-        ws->on_message_ref = LUA_NOREF;
+    if (ws->writing) {
+        ws->cleanup_pending = true;
+        return;
     }
-    if (ws->on_close_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, ws->on_close_ref);
-        ws->on_close_ref = LUA_NOREF;
-    }
-    if (ws->self_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, ws->self_ref);
-        ws->self_ref = LUA_NOREF;
-    }
+    ws_cleanup_now(ws);
 }
 
 static http_ws_t *ws_check(lua_State *L) {
@@ -618,7 +641,7 @@ static int l_ws_is_open(lua_State *L) {
 
 static int l_ws_gc(lua_State *L) {
     http_ws_t *ws = (http_ws_t *)luaL_checkudata(L, 1, HTTP_WS_MT);
-    ws_free_resources(ws);
+    ws_cleanup_now(ws);
     return 0;
 }
 

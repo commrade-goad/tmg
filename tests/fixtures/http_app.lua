@@ -1,4 +1,5 @@
 local http = require("http")
+local saved_res
 
 http.get("/", function(req, res)
     res:send("hello")
@@ -63,6 +64,26 @@ http.get("/escape-off", function(req, res)
     res:render("escape.tmg", { text = [[<b>"&'</b>]], raw = "<i>raw</i>" }, { autoescape = false })
 end)
 
+http.get("/stash-response", function(req, res)
+    saved_res = res
+    res:send("stored")
+end)
+
+http.get("/use-stale-response", function(req, res)
+    local ok, err = pcall(function()
+        saved_res:send("late")
+    end)
+    if ok then
+        res:send("unexpected")
+    else
+        res:send(tostring(err))
+    end
+end)
+
+http.get("/too-large-response", function(req, res)
+    res:send(string.rep("x", 8192))
+end)
+
 http.ws("/ws/:room", function(ws, req)
     local room = req.params.room
     ws:on("message", function(ws, data, binary)
@@ -95,6 +116,7 @@ local ok = http.listen({
     port = 18080,
     max_body = 2 * 1024 * 1024,
     max_static_size = 1024 * 1024,
+    max_response = 4096,
     keepalive_timeout = 1,
     upload_dir = "tests/uploads",
     template_root = "tests/fixtures/templates",

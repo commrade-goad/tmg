@@ -18,6 +18,17 @@ static http_conn_t *conn_of(llhttp_t *p) {
 static void conn_free(http_conn_t *c);
 static void timer_cb(uv_timer_t *t);
 
+void http_conn_timer_set(http_conn_t *c, unsigned mode, unsigned timeout_secs) {
+    if (!c || !c->timer_init) return;
+    if (timeout_secs > 0) {
+        c->timer_mode = mode;
+        uv_timer_start(&c->timer, timer_cb, (uint64_t)timeout_secs * 1000, 0);
+    } else {
+        c->timer_mode = HTTP_TIMER_NONE;
+        uv_timer_stop(&c->timer);
+    }
+}
+
 static void stop_reading(http_conn_t *c) {
     if (c->reading) {
         uv_read_stop((uv_stream_t *)&c->handle);
@@ -37,7 +48,12 @@ static void flush_header(http_conn_t *c) {
 
 static int on_message_begin(llhttp_t *p) {
     http_conn_t *c = conn_of(p);
+    c->req_generation++;
+    if (c->req_generation == 0)
+        c->req_generation = 1;
+    http_response_detach_all(c);
     http_conn_reset_request(c);
+    http_conn_timer_set(c, HTTP_TIMER_HEADER, c->state->cfg.header_timeout);
     return 0;
 }
 
@@ -126,6 +142,10 @@ static int on_headers_complete(llhttp_t *p) {
     c->version = http_strdup(ver);
 
     c->keep_alive = llhttp_should_keep_alive(p) != 0;
+    unsigned body_timeout = c->state->cfg.body_timeout;
+    if (body_timeout == 0)
+        body_timeout = c->state->cfg.header_timeout;
+    http_conn_timer_set(c, HTTP_TIMER_BODY, body_timeout);
 
     const char *cl = http_header_get(c->headers, c->nheaders, "content-length");
     if (cl && *cl) {
@@ -171,8 +191,7 @@ static int on_message_complete(llhttp_t *p) {
     c->message_complete = true;
     c->keepalive_wait = false;
     stop_reading(c);
-    if (c->timer_init)
-        uv_timer_stop(&c->timer);
+    http_conn_timer_set(c, HTTP_TIMER_NONE, 0);
 
     if (llhttp_get_upgrade(p)) {
         /* llhttp pauses with HPE_PAUSED_UPGRADE after this callback.  Dispatch
@@ -183,6 +202,7 @@ static int on_message_complete(llhttp_t *p) {
 
     llhttp_pause(p);
     c->handler_running = true;
+    http_conn_timer_set(c, HTTP_TIMER_HANDLER, c->state->cfg.handler_timeout);
     http_dispatch(c);
     c->handler_running = false;
     return 0;
@@ -224,13 +244,6 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     }
 
     c->keepalive_wait = false;
-    if (c->timer_init) {
-        unsigned timeout = c->state->cfg.header_timeout;
-        if (timeout > 0)
-            uv_timer_start(&c->timer, timer_cb, (uint64_t)timeout * 1000, 0);
-        else
-            uv_timer_stop(&c->timer);
-    }
 
     llhttp_errno_t err = llhttp_execute(&c->parser, buf->base, (size_t)nread);
     if (err == HPE_OK) {
@@ -282,6 +295,7 @@ void http_conn_write_cb(uv_write_t *req, int status) {
     free(c->write_buf);
     c->write_buf = NULL;
     c->write_len = 0;
+    http_conn_timer_set(c, HTTP_TIMER_NONE, 0);
 
     if (c->closing) return;
     if (status < 0) {
@@ -295,17 +309,13 @@ void http_conn_write_cb(uv_write_t *req, int status) {
     }
 
     http_response_reset(c);
+    http_response_detach_all(c);
     http_conn_reset_request(c);
     llhttp_resume(&c->parser);
 
     c->keepalive_wait = true;
     unsigned keepalive = c->state->cfg.keepalive_timeout;
-    if (c->timer_init) {
-        if (keepalive > 0)
-            uv_timer_start(&c->timer, timer_cb, (uint64_t)keepalive * 1000, 0);
-        else
-            uv_timer_stop(&c->timer);
-    }
+    http_conn_timer_set(c, HTTP_TIMER_KEEPALIVE, keepalive);
 
     int rc = uv_read_start((uv_stream_t *)&c->handle, on_alloc, on_read);
     if (rc != 0) {
@@ -319,15 +329,21 @@ void http_conn_write_cb(uv_write_t *req, int status) {
 static void timer_cb(uv_timer_t *t) {
     http_conn_t *c = (http_conn_t *)t->data;
     if (c->closing) return;
-    if (c->keepalive_wait) {
+    c->timed_out = true;
+    if (c->timer_mode == HTTP_TIMER_KEEPALIVE || c->keepalive_wait) {
         http_conn_close(c);
+        c->timed_out = false;
         return;
     }
-    if (!c->message_complete && !c->handler_running) {
+    if (c->timer_mode == HTTP_TIMER_HANDLER || c->handler_running ||
+        c->timer_mode == HTTP_TIMER_WRITE || c->writing) {
+        http_conn_send_error(c, 504, http_status_reason(504));
+    } else if (!c->message_complete) {
         http_conn_send_error(c, 408, http_status_reason(408));
     } else {
         http_conn_close(c);
     }
+    c->timed_out = false;
 }
 
 static void on_timer_close(uv_handle_t *h) {
@@ -356,6 +372,7 @@ static void conn_free(http_conn_t *c) {
         }
     }
 
+    http_response_detach_all(c);
     http_ws_cleanup(c);
     free(c->method);
     free(c->version);
@@ -373,6 +390,7 @@ static void conn_free(http_conn_t *c) {
 void http_conn_close(http_conn_t *c) {
     if (!c || c->closing) return;
     c->closing = true;
+    http_response_detach_all(c);
     stop_reading(c);
     http_ws_disconnect(c);
 
@@ -412,6 +430,7 @@ void http_conn_reset_request(http_conn_t *c) {
     c->expect_continue = false;
     c->limit_status = 0;
     c->header_bytes = 0;
+    c->timer_mode = HTTP_TIMER_NONE;
 }
 
 static void on_new_connection(uv_stream_t *server, int status) {
@@ -441,6 +460,8 @@ static void on_new_connection(uv_stream_t *server, int status) {
         return;
     }
     c->close_refs = 0;
+    c->req_generation = 1;
+    c->timer_mode = HTTP_TIMER_NONE;
 
     if (uv_accept(server, (uv_stream_t *)&c->handle) != 0) {
         http_conn_close(c);
@@ -485,8 +506,7 @@ static void on_new_connection(uv_stream_t *server, int status) {
     c->reading = true;
 
     unsigned timeout = st->cfg.header_timeout;
-    if (timeout > 0)
-        uv_timer_start(&c->timer, timer_cb, (uint64_t)timeout * 1000, 0);
+    http_conn_timer_set(c, HTTP_TIMER_HEADER, timeout);
 }
 
 static void on_server_close(uv_handle_t *h) {
@@ -506,11 +526,18 @@ static void close_signals(http_state_t *st) {
         uv_close((uv_handle_t *)&st->sigint, NULL);
         st->sigint_init = false;
     }
+
     if (st->sigterm_init) {
         uv_signal_stop(&st->sigterm);
         uv_close((uv_handle_t *)&st->sigterm, NULL);
         st->sigterm_init = false;
     }
+}
+
+static void close_walk_cb(uv_handle_t *h, void *arg) {
+    (void)arg;
+    if (!uv_is_closing(h))
+        uv_close(h, NULL);
 }
 
 static void on_signal(uv_signal_t *handle, int signum) {
@@ -648,11 +675,22 @@ void http_state_deinit(lua_State *L) {
     memset(&st->cfg, 0, sizeof(st->cfg));
 
     if (st->loop) {
-        uv_run(st->loop, UV_RUN_NOWAIT);
-        int rc = uv_loop_close(st->loop);
-        if (rc != 0)
-            http_log("uv_loop_close: %s", uv_strerror(rc));
-        st->loop = NULL;
+        int attempts = 0;
+        int rc;
+        do {
+            uv_run(st->loop, UV_RUN_NOWAIT);
+            rc = uv_loop_close(st->loop);
+            if (rc == UV_EBUSY) {
+                uv_walk(st->loop, close_walk_cb, NULL);
+                uv_run(st->loop, UV_RUN_DEFAULT);
+            }
+            attempts++;
+        } while (rc == UV_EBUSY && attempts < 16);
+        if (rc != 0) {
+            http_log("uv_loop_close failed: %s", uv_strerror(rc));
+        } else {
+            st->loop = NULL;
+        }
     }
     st->server_init = false;
     st->listening = false;

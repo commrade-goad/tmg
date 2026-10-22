@@ -189,6 +189,12 @@ bool http_static_serve(http_conn_t *c, const char *method, const char *path) {
             static_error(c, 500, NULL);
             return true;
         }
+        if (c->state->cfg.max_response &&
+            (uintmax_t)st.st_size > (uintmax_t)c->state->cfg.max_response) {
+            http_log("static file exceeds max_response: %s", file);
+            static_error(c, 500, NULL);
+            return true;
+        }
 
         FILE *f = fopen(file, "rb");
         if (!f) {
@@ -218,6 +224,13 @@ bool http_static_serve(http_conn_t *c, const char *method, const char *path) {
                 c->res_body.len + got > c->state->cfg.max_static_size) {
                 fclose(f);
                 http_log("static file grew too large: %s", file);
+                static_error(c, 500, NULL);
+                return true;
+            }
+            if (c->state->cfg.max_response &&
+                c->res_body.len + got > c->state->cfg.max_response) {
+                fclose(f);
+                http_log("static file response exceeds max_response: %s", file);
                 static_error(c, 500, NULL);
                 return true;
             }
