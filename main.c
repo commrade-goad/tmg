@@ -1,5 +1,6 @@
 #include <luajit.h>
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -11,6 +12,7 @@
 #include <lauxlib.h>
 
 #include "argparse.h"
+#include "http.h"
 #include "str.h"
 
 #ifndef luaL_requiref
@@ -187,21 +189,34 @@ static void flush_text_buffer(str_t *builder, str_t *buffer, linemap_t *lm, int 
 
 /* ---- core expand ---------------------------------------------------------- */
 
-static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool debug)
+static void tmg_set_error(str_t *err, const char *msg) {
+    if (!err) return;
+    str_clear(err);
+    str_push(err, msg ? msg : "(unknown error)");
+}
+
+static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool debug,
+                       int data_idx, str_t *err)
 {
     FILE *in = fopen(in_path, "r");
     if (!in) {
-        fprintf(stderr, "ERR: Failed to read the input file `%s`: %s\n",
-                in_path, strerror(errno));
+        char msg[1024];
+        snprintf(msg, sizeof(msg), "failed to read `%s`: %s", in_path, strerror(errno));
+        fprintf(stderr, "ERR: %s\n", msg);
+        tmg_set_error(err, msg);
         return false;
     }
     fseek(in, 0, SEEK_END);
-    long in_size = ftell(in);
+    long file_size = ftell(in);
     rewind(in);
+    size_t in_size = file_size > 0 ? (size_t)file_size : 0;
+    int initial_cap = 16;
+    if (in_size > 0 && in_size <= (size_t)INT_MAX / 2)
+        initial_cap = (int)(in_size * 2);
 
     size_t sepsize = strlen(sep);
     str_t match_buf = str_init(sepsize + 1);
-    str_t builder   = str_init(in_size * 2);
+    str_t builder   = str_init(initial_cap);
     str_t buffer    = str_init(100);
     linemap_t lm    = linemap_init();
     int gen_line    = 1;
@@ -294,7 +309,9 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
     snprintf(chunkname, sizeof(chunkname), "@%s", in_path);
 
     if (luaL_loadbuffer(L, builder.data, builder.len, chunkname) != LUA_OK) {
-        report_error_with_code(lua_tostring(L, -1), in_path, &lm, builder.data);
+        const char *msg = lua_tostring(L, -1);
+        tmg_set_error(err, msg);
+        report_error_with_code(msg, in_path, &lm, builder.data);
         lua_pop(L, 1);
         str_deinit(&builder);
         str_deinit(&buffer);
@@ -308,10 +325,19 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
     lua_pushvalue(L, -2); /* duplicate chunk function */
     lua_xmove(L, co, 1);  /* move function onto thread stack */
 
-    str_t final_output = str_init(in_size * 2);
+    /* Per-request data is passed as the template chunk's vararg, so
+     * templates can use `local data = ...` without touching globals. */
+    int nargs = 0;
+    if (data_idx > 0) {
+        lua_pushvalue(L, data_idx);
+        lua_xmove(L, co, 1);
+        nargs = 1;
+    }
+
+    str_t final_output = str_init(initial_cap);
     bool success = false;
 
-    int status = lua_resume(co, 0);
+    int status = lua_resume(co, nargs);
 
     while (status == LUA_YIELD) {
         int top = lua_gettop(co);
@@ -319,7 +345,7 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
             if (lua_isstring(co, i)) {
                 size_t len;
                 const char *chunk = lua_tolstring(co, i, &len);
-                str_push(&final_output, chunk);
+                str_push_len(&final_output, chunk, len);
             }
         }
         lua_pop(co, top);
@@ -336,7 +362,9 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
         success = true;
     } else {
         /* Runtime error during coroutine streaming */
-        report_error_with_code(lua_tostring(co, -1), in_path, &lm, builder.data);
+        const char *msg = lua_tostring(co, -1);
+        tmg_set_error(err, msg);
+        report_error_with_code(msg, in_path, &lm, builder.data);
         lua_pop(L, 2); /* pop thread and function on error */
     }
 
@@ -354,7 +382,7 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
 bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
                 const char *sep, bool debug)
 {
-    if (!tmg_expand(L, in_path, sep, debug)) return false;
+    if (!tmg_expand(L, in_path, sep, debug, 0, NULL)) return false;
 
     const char *result = lua_tostring(L, -1);
     bool success = false;
@@ -373,7 +401,7 @@ bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
 
 bool tmg_render_string(lua_State *L, const char *in_path, const char *sep, bool debug)
 {
-    return tmg_expand(L, in_path, sep, debug);
+    return tmg_expand(L, in_path, sep, debug, 0, NULL);
 }
 
 /* ---- TMG_LIB_PATH ---------------------------------------------------------- */
@@ -579,12 +607,17 @@ static int l_tmg_render_string(lua_State *L) {
     const char *in_path = luaL_checkstring(L, 1);
     const char *sep = resolve_sep(L, 2);
     bool debug = resolve_debug(L);
+    int data_idx = lua_isnoneornil(L, 3) ? 0 : 3;
 
-    if (tmg_render_string(L, in_path, sep, debug)) {
+    str_t err = str_init(64);
+    if (tmg_expand(L, in_path, sep, debug, data_idx, &err)) {
+        str_deinit(&err);
         return 1;
     }
     lua_pushnil(L);
-    return 1;
+    lua_pushlstring(L, err.data, err.len);
+    str_deinit(&err);
+    return 2;
 }
 
 static const luaL_Reg tmg_lib[] = {
@@ -642,6 +675,9 @@ int main(int argc, char **argv)
     luaL_requiref(L, "tmg", luaopen_tmg, 1);
     lua_pop(L, 1);
 
+    luaL_requiref(L, "http", luaopen_http, 1);
+    lua_pop(L, 1);
+
     int exit_code = EXIT_SUCCESS;
 
     lua_pushcfunction(L, msghandler);
@@ -662,8 +698,11 @@ int main(int argc, char **argv)
             fprintf(stderr, "ERR: %s\n", lua_tostring(L, -1));
             lua_pop(L, 1);
             exit_code = EXIT_FAILURE;
+        } else {
+            http_state_run(L);
         }
     }
+    http_state_deinit(L);
     lua_remove(L, msgh_idx);
 
     lua_close(L);

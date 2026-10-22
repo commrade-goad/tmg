@@ -1,6 +1,8 @@
 #ifndef STR_H_
 #define STR_H_
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -12,8 +14,10 @@ typedef struct str_t {
 
 str_t str_init(int cap);
 void str_deinit(str_t *str);
+bool str_reserve(str_t *str, size_t need);
 void str_push_chr(str_t *str, const char data);
 void str_push(str_t *str, const char *data);
+void str_push_len(str_t *str, const char *data, size_t len);
 void str_pop_chr(str_t *str);
 void str_clear(str_t *str);
 

@@ -7,13 +7,24 @@ themselves still use `lua` to script the parts that expand.
 Generate base16 colors using wallpaper with [tmg-wall](https://github.com/commrade-goad/tmg-wall).
 
 ## Build
-1. __Dependency:__
-    * `lua`
+All third-party dependencies are cloned into `deps/` and built from source;
+nothing is taken from the system package manager:
 
-2. __Build:__
+* libuv `v1.53.0`
+* llhttp `release/v9.4.3` (pre-generated C, no Node needed)
+* LuaJIT in `LuaJIT-2.1/`
 
 ```sh
+make deps          # optional: clone dependencies now
 make all -j$(nproc)
+```
+
+`make` links `libluajit.a`, `libuv.a` and `libllhttp.a` statically into the
+`tmg` binary. libc remains dynamic; a fully static glibc binary is not
+attempted. Verify with:
+
+```sh
+ldd ./tmg           # no libuv/llhttp/luajit shared libraries
 ```
 
 ## Usage
@@ -43,8 +54,17 @@ tmg_debug = true
 ```
 
 Inside a `.tmg` file, the delimiter char toggles between plain text and
-embedded Lua (default `%`); use `$` right after opening a code block to
-print an expression inline (`%$expr%`). See `example/` for templates.
+embedded Lua (default `%`). Use `tmg.print(...)` inside a code block to emit
+a value:
+
+```
+% local data = ... %
+Hello % tmg.print(data.name) %!
+```
+
+`tmg.render_string(path, sep, data)` returns the rendered string, or
+`nil, error`. The optional `data` value is passed to the template chunk as
+its vararg, so `local data = ...` works without touching globals.
 
 Because rendering happens in the same Lua state your build script is
 running in, anything the script `require`s or sets as a global is visible
@@ -69,6 +89,66 @@ print(arg[-1])                 -- the tmg binary, as invoked
 `arg` is a normal global, so templates rendered by the script can read it too.
 `tmg`'s own options (`-h`, `-v`) are only recognized *before* the script name,
 so `tmg build.lua -v` hands `-v` to your script.
+
+## HTTP server
+A libuv + llhttp HTTP/1.1 server is built in. Calling `http.listen` starts
+it; after the script returns, `tmg` runs the event loop:
+
+```lua
+local http = require("http")
+
+http.get("/", function(req, res)
+    res:send("hello")
+end)
+
+-- :id becomes req.params.id
+http.get("/tu/requests/:id", function(req, res)
+    res:render("request.tmg", { id = req.params.id })
+end)
+
+http.post("/tu/requests/:id/approve", function(req, res)
+    if req.cookies.session_id ~= "admin" then
+        res:status(401):send("unauthorized")
+        return
+    end
+    res:json({ approved = true, id = req.params.id })
+end)
+
+http.listen {
+    host = "127.0.0.1",
+    port = 8080,
+    upload_dir = "uploads",       -- multipart file destination
+    template_root = "templates",  -- res:render() is confined to this
+    max_body = 10 * 1024 * 1024,
+    header_timeout = 10,
+    keepalive_timeout = 15,
+}
+```
+
+Routes can also be registered with `http.route(method, pattern, handler)`;
+`http.put/patch/delete/head/options` mirror `get/post`.
+
+`req` contains `method`, `url`, `path`, `query`, `version`, `headers`,
+`cookies`, `body`, `params`, `query_params`, `form`, `files`, and
+`remote_address`. Helpers: `req:header(name)`, `req:query(name)`,
+`req:is_keep_alive()`, `req:remote_address()`. Uploaded multipart files are
+saved under `upload_dir` and exposed as
+`{ field, filename, content_type, path, size }` entries in `req.files`.
+
+`res` methods: `status(code)`, `header(name, value)`, `send(body)`,
+`json(value)`, `html(body)`, `redirect(location, status)`,
+`cookie(name, value, opts)`, `render(template, data)`, `close()`.
+`res:cookie` defaults to `HttpOnly; SameSite=Lax; Path=/`; options include
+`path`, `domain`, `max_age`, `expires`, `secure`, `httponly`, `samesite`.
+
+Every handler is invoked through a protected Lua call. A syntax/runtime
+error returns HTTP 500 to that request, logs a traceback, and leaves the
+server loop running. Set `debug = true` in `http.listen` to include the Lua
+error text in the 500 body.
+
+`http.stop()` closes the listener and signal handles; active responses finish
+and idle keep-alive connections are closed. `tests/fixtures/http_app.lua`
+plus `tests/test_http.py` are a runnable example (`make test`).
 
 ## Extra library paths
 Set `TMG_LIB_PATH` to a `:`-separated list of directories to make your own

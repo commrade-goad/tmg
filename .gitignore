@@ -1,0 +1,7 @@
+*.o
+tmg
+uploads/
+tests/uploads/
+deps/libuv/
+deps/llhttp/
+tests/__pycache__/
