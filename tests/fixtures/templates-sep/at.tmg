@@ -1,0 +1,2 @@
+@@ local name = ... @@
+At: @@ tmg.print(name) @@; percent: 100%; hash: # literal.

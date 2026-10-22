@@ -1,6 +1,7 @@
 #include <luajit.h>
 #include <ctype.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -13,7 +14,11 @@
 
 #include "argparse.h"
 #include "http.h"
+#include "template_cache.h"
+#include "uv_module.h"
 #include "str.h"
+
+#include <uv.h>
 
 #define TMG_RAW_MT "tmg.raw"
 
@@ -38,6 +43,24 @@ static void tmg_push_raw(lua_State *L, const char *s, size_t len) {
     raw->data[len] = '\0';
     luaL_getmetatable(L, TMG_RAW_MT);
     lua_setmetatable(L, -2);
+}
+
+static size_t tmg_escaped_len(const char *s, size_t len) {
+    size_t out = 0;
+    for (size_t i = 0; i < len; i++) {
+        size_t add = 1;
+        switch ((unsigned char)s[i]) {
+        case '&': add = 5; break;
+        case '<': add = 4; break;
+        case '>': add = 4; break;
+        case '"': add = 6; break;
+        case '\'': add = 5; break;
+        default: break;
+        }
+        if (out > SIZE_MAX - add) return SIZE_MAX;
+        out += add;
+    }
+    return out;
 }
 
 static void tmg_push_escaped(str_t *out, const char *s, size_t len) {
@@ -253,8 +276,9 @@ static void tmg_set_error(str_t *err, const char *msg) {
     str_push(err, msg ? msg : "(unknown error)");
 }
 
-static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool debug,
-                       int data_idx, bool html, str_t *err)
+static bool tmg_compile(lua_State *L, const char *in_path, const char *sep,
+                        bool debug, str_t *code_out, linemap_t *lm_out,
+                        int *func_ref, str_t *err)
 {
     FILE *in = fopen(in_path, "r");
     if (!in) {
@@ -378,6 +402,23 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
         return false;
     }
 
+    *func_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    *code_out = builder;
+    *lm_out = lm;
+    builder = (str_t){0};
+    lm = (linemap_t){0};
+
+    str_deinit(&buffer);
+    str_deinit(&match_buf);
+    return true;
+}
+
+static bool tmg_execute(lua_State *L, int func_ref, const char *in_path,
+                        const char *code, const linemap_t *lm,
+                        int data_idx, bool html, size_t max_output, str_t *err)
+{
+    lua_rawgeti(L, LUA_REGISTRYINDEX, func_ref);
+
     /* Create thread context */
     lua_State *co = lua_newthread(L);
     lua_pushvalue(L, -2); /* duplicate chunk function */
@@ -392,54 +433,375 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
         nargs = 1;
     }
 
-    str_t final_output = str_init(initial_cap);
+    /* TODO(streaming): Rendering currently buffers the complete result in
+     * final_output for compatibility with tmg.render/render_string/res:render.
+     * If template streaming is needed later, replace this buffer with a sink
+     * abstraction and write escaped/raw chunks directly to the destination.
+     * max_output accounting must move with the sink. */
+    str_t final_output = str_init(256);
     bool success = false;
+    bool output_too_large = false;
 
     int status = lua_resume(co, nargs);
 
     while (status == LUA_YIELD) {
         int top = lua_gettop(co);
         for (int i = 1; i <= top; i++) {
+            size_t len = 0;
+            size_t add = 0;
+            const char *chunk = NULL;
+            tmg_raw_t *raw = NULL;
             if (lua_isstring(co, i)) {
-                size_t len;
-                const char *chunk = lua_tolstring(co, i, &len);
+                chunk = lua_tolstring(co, i, &len);
+                add = html ? tmg_escaped_len(chunk, len) : len;
+            } else {
+                raw = tmg_raw_check(co, i);
+                if (raw) {
+                    len = raw->len;
+                    add = raw->len;
+                }
+            }
+
+            if (max_output && (add > max_output ||
+                               final_output.len > max_output - add)) {
+                output_too_large = true;
+                break;
+            }
+            if (chunk) {
                 if (html)
                     tmg_push_escaped(&final_output, chunk, len);
                 else
                     str_push_len(&final_output, chunk, len);
-            } else {
-                tmg_raw_t *raw = tmg_raw_check(co, i);
-                if (raw)
-                    str_push_len(&final_output, raw->data, raw->len);
+            } else if (raw) {
+                str_push_len(&final_output, raw->data, raw->len);
             }
         }
         lua_pop(co, top);
 
+        if (output_too_large)
+            break;
         status = lua_resume(co, 0);
     }
 
-    if (status == LUA_OK) {
+    if (!output_too_large && status == LUA_OK) {
         /* Clean thread and chunk function off main stack BEFORE pushing result */
         lua_pop(L, 2); /* pops 'co' and loaded chunk function */
-
-        /* Push result string - now it is strictly on top of stack L */
         lua_pushlstring(L, final_output.data, final_output.len);
         success = true;
+    } else if (output_too_large) {
+        tmg_set_error(err, "rendered output exceeds max_output");
+        lua_pop(L, 2); /* pop thread and function */
     } else {
-        /* Runtime error during coroutine streaming */
         const char *msg = lua_tostring(co, -1);
         tmg_set_error(err, msg);
-        report_error_with_code(msg, in_path, &lm, builder.data);
+        report_error_with_code(msg, in_path, lm, code);
         lua_pop(L, 2); /* pop thread and function on error */
     }
 
     str_deinit(&final_output);
-    str_deinit(&builder);
-    str_deinit(&buffer);
-    str_deinit(&match_buf);
-    linemap_deinit(&lm);
-
     return success;
+}
+
+static bool tmg_expand(lua_State *L, const char *in_path, const char *sep,
+                       bool debug, int data_idx, bool html, size_t max_output,
+                       str_t *err)
+{
+    str_t code = {0};
+    linemap_t lm = {0};
+    int func_ref = LUA_NOREF;
+
+    if (!tmg_compile(L, in_path, sep, debug, &code, &lm, &func_ref, err))
+        return false;
+
+    bool ok = tmg_execute(L, func_ref, in_path, code.data, &lm,
+                          data_idx, html, max_output, err);
+
+    luaL_unref(L, LUA_REGISTRYINDEX, func_ref);
+    str_deinit(&code);
+    linemap_deinit(&lm);
+    return ok;
+}
+
+/* ---- compiled template cache ------------------------------------------ */
+
+typedef struct {
+    char *path;
+    char *sep;
+    str_t code;
+    linemap_t lm;
+    uv_stat_t st;
+    uint64_t last_used;
+    int func_ref;
+    bool has_stat;
+} tmg_cache_entry_t;
+
+struct tmg_template_cache {
+    tmg_cache_entry_t *items;
+    size_t n;
+    size_t cap;
+    size_t max_entries;
+    uint64_t tick;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t reloads;
+    uint64_t evictions;
+    int mode;
+};
+
+static char *cache_strdup(const char *s) {
+    if (!s) s = "";
+    size_t len = strlen(s);
+    char *p = malloc(len + 1);
+    if (!p) return NULL;
+    memcpy(p, s, len + 1);
+    return p;
+}
+
+static void cache_entry_clear(lua_State *L, tmg_cache_entry_t *e) {
+    if (e->func_ref != LUA_NOREF)
+        luaL_unref(L, LUA_REGISTRYINDEX, e->func_ref);
+    free(e->path);
+    free(e->sep);
+    str_deinit(&e->code);
+    linemap_deinit(&e->lm);
+    memset(e, 0, sizeof(*e));
+    e->func_ref = LUA_NOREF;
+}
+
+static void cache_remove_at(lua_State *L, tmg_template_cache_t *cache,
+                            size_t idx) {
+    if (!cache || idx >= cache->n) return;
+    cache_entry_clear(L, &cache->items[idx]);
+    if (idx + 1 < cache->n) {
+        memmove(&cache->items[idx], &cache->items[idx + 1],
+                (cache->n - idx - 1) * sizeof(cache->items[0]));
+    }
+    cache->n--;
+}
+
+static int cache_find(tmg_template_cache_t *cache, const char *path,
+                      const char *sep) {
+    if (!cache) return -1;
+    for (size_t i = 0; i < cache->n; i++) {
+        if (strcmp(cache->items[i].path, path) == 0 &&
+            strcmp(cache->items[i].sep, sep) == 0)
+            return (int)i;
+    }
+    return -1;
+}
+
+static bool cache_stat(const char *path, uv_stat_t *st) {
+    uv_fs_t req;
+    int rc = uv_fs_stat(NULL, &req, path, NULL);
+    if (rc < 0) {
+        uv_fs_req_cleanup(&req);
+        return false;
+    }
+    *st = req.statbuf;
+    uv_fs_req_cleanup(&req);
+    return true;
+}
+
+static bool cache_same_stat(const uv_stat_t *a, const uv_stat_t *b) {
+    return a->st_mtim.tv_sec == b->st_mtim.tv_sec &&
+           a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+           a->st_size == b->st_size &&
+           a->st_ino == b->st_ino;
+}
+
+static void cache_touch(tmg_template_cache_t *cache, size_t idx) {
+    cache->items[idx].last_used = ++cache->tick;
+}
+
+static void cache_evict_lru(lua_State *L, tmg_template_cache_t *cache) {
+    if (!cache || cache->n == 0) return;
+    size_t victim = 0;
+    for (size_t i = 1; i < cache->n; i++) {
+        if (cache->items[i].last_used < cache->items[victim].last_used)
+            victim = i;
+    }
+    cache_remove_at(L, cache, victim);
+    cache->evictions++;
+}
+
+tmg_template_cache_t *tmg_template_cache_create(int mode, size_t max_entries) {
+    tmg_template_cache_t *cache = calloc(1, sizeof(*cache));
+    if (!cache) return NULL;
+    cache->mode = mode;
+    cache->max_entries = max_entries ? max_entries : 256;
+    return cache;
+}
+
+void tmg_template_cache_clear(tmg_template_cache_t *cache, lua_State *L) {
+    if (!cache) return;
+    for (size_t i = 0; i < cache->n; i++)
+        cache_entry_clear(L, &cache->items[i]);
+    cache->n = 0;
+}
+
+void tmg_template_cache_set(tmg_template_cache_t *cache, lua_State *L,
+                            int mode, size_t max_entries) {
+    if (!cache) return;
+    size_t max = max_entries ? max_entries : 256;
+    if (cache->mode != mode || cache->max_entries != max)
+        tmg_template_cache_clear(cache, L);
+    cache->mode = mode;
+    cache->max_entries = max;
+}
+
+void tmg_template_cache_free(tmg_template_cache_t *cache, lua_State *L) {
+    if (!cache) return;
+    tmg_template_cache_clear(cache, L);
+    free(cache->items);
+    free(cache);
+}
+
+int tmg_template_cache_stats(lua_State *L, tmg_template_cache_t *cache) {
+    lua_createtable(L, 0, 8);
+    const char *mode = "off";
+    if (cache && cache->mode == TMG_CACHE_DEVELOPMENT) mode = "development";
+    else if (cache && cache->mode == TMG_CACHE_PRODUCTION) mode = "production";
+
+    lua_pushstring(L, mode);
+    lua_setfield(L, -2, "mode");
+    lua_pushinteger(L, cache ? (lua_Integer)cache->n : 0);
+    lua_setfield(L, -2, "entries");
+    lua_pushinteger(L, cache ? (lua_Integer)cache->max_entries : 0);
+    lua_setfield(L, -2, "max_entries");
+    lua_pushinteger(L, cache ? (lua_Integer)cache->hits : 0);
+    lua_setfield(L, -2, "hits");
+    lua_pushinteger(L, cache ? (lua_Integer)cache->misses : 0);
+    lua_setfield(L, -2, "misses");
+    lua_pushinteger(L, cache ? (lua_Integer)cache->reloads : 0);
+    lua_setfield(L, -2, "reloads");
+    lua_pushinteger(L, cache ? (lua_Integer)cache->evictions : 0);
+    lua_setfield(L, -2, "evictions");
+    return 1;
+}
+
+static const char *cache_resolve_sep(lua_State *L, const char *sep) {
+    if (sep) return sep;
+    const char *resolved = "%";
+    lua_getglobal(L, "tmg_delim");
+    if (lua_isstring(L, -1)) {
+        const char *s = lua_tostring(L, -1);
+        if (s) resolved = s;
+    }
+    lua_pop(L, 1);
+    return resolved;
+}
+
+static bool cache_store(lua_State *L, tmg_template_cache_t *cache,
+                        const char *path, const char *sep, str_t *code,
+                        linemap_t *lm, int *func_ref, const uv_stat_t *st,
+                        bool has_stat) {
+    if (cache->n >= cache->max_entries)
+        cache_evict_lru(L, cache);
+
+    if (cache->n >= cache->cap) {
+        size_t ncap = cache->cap ? cache->cap * 2 : 8;
+        tmg_cache_entry_t *items = realloc(cache->items,
+                                           ncap * sizeof(*items));
+        if (!items) return false;
+        cache->items = items;
+        cache->cap = ncap;
+    }
+
+    tmg_cache_entry_t *e = &cache->items[cache->n++];
+    memset(e, 0, sizeof(*e));
+    e->path = cache_strdup(path);
+    e->sep = cache_strdup(sep);
+    if (!e->path || !e->sep) {
+        cache_entry_clear(L, e);
+        cache->n--;
+        return false;
+    }
+    e->code = *code;
+    e->lm = *lm;
+    e->func_ref = *func_ref;
+    *code = (str_t){0};
+    *lm = (linemap_t){0};
+    *func_ref = LUA_NOREF;
+    if (has_stat) e->st = *st;
+    e->has_stat = has_stat;
+    cache_touch(cache, cache->n - 1);
+    return true;
+}
+
+bool tmg_render_cached(lua_State *L, tmg_template_cache_t *cache,
+                       const char *in_path, const char *sep, bool debug,
+                       int data_idx, bool html, size_t max_output, str_t *err) {
+    const char *key_sep = cache_resolve_sep(L, sep);
+    if (!cache || cache->mode == TMG_CACHE_OFF)
+        return tmg_expand(L, in_path, key_sep, debug, data_idx, html,
+                          max_output, err);
+
+    uv_stat_t st;
+    bool have_stat = false;
+    if (cache->mode == TMG_CACHE_DEVELOPMENT) {
+        have_stat = cache_stat(in_path, &st);
+        if (!have_stat) {
+            int idx = cache_find(cache, in_path, key_sep);
+            if (idx >= 0)
+                cache_remove_at(L, cache, (size_t)idx);
+            /* Let the uncached path produce the canonical read error. */
+            return tmg_expand(L, in_path, key_sep, debug, data_idx, html,
+                              max_output, err);
+        }
+    }
+
+    int idx = cache_find(cache, in_path, key_sep);
+    if (idx >= 0) {
+        tmg_cache_entry_t *e = &cache->items[idx];
+        if (cache->mode == TMG_CACHE_DEVELOPMENT &&
+            (!e->has_stat || !cache_same_stat(&e->st, &st))) {
+            str_t code = {0};
+            linemap_t lm = {0};
+            int func_ref = LUA_NOREF;
+            if (!tmg_compile(L, in_path, key_sep, debug, &code, &lm,
+                             &func_ref, err)) {
+                cache_remove_at(L, cache, (size_t)idx);
+                return false;
+            }
+            luaL_unref(L, LUA_REGISTRYINDEX, e->func_ref);
+            str_deinit(&e->code);
+            linemap_deinit(&e->lm);
+            e->code = code;
+            e->lm = lm;
+            e->func_ref = func_ref;
+            e->st = st;
+            e->has_stat = true;
+            cache->reloads++;
+        } else if (debug) {
+            fprintf(stderr, "-- cached chunk for %s --\n%s-- end --\n",
+                    in_path, e->code.data ? e->code.data : "");
+        }
+        cache->hits++;
+        cache_touch(cache, (size_t)idx);
+        return tmg_execute(L, e->func_ref, in_path, e->code.data, &e->lm,
+                           data_idx, html, max_output, err);
+    }
+
+    cache->misses++;
+    str_t code = {0};
+    linemap_t lm = {0};
+    int func_ref = LUA_NOREF;
+    if (!tmg_compile(L, in_path, key_sep, debug, &code, &lm, &func_ref, err))
+        return false;
+
+    if (!cache_store(L, cache, in_path, key_sep, &code, &lm, &func_ref, &st,
+                     have_stat)) {
+        bool ok = tmg_execute(L, func_ref, in_path, code.data, &lm,
+                              data_idx, html, max_output, err);
+        luaL_unref(L, LUA_REGISTRYINDEX, func_ref);
+        str_deinit(&code);
+        linemap_deinit(&lm);
+        return ok;
+    }
+
+    tmg_cache_entry_t *e = &cache->items[cache->n - 1];
+    return tmg_execute(L, e->func_ref, in_path, e->code.data, &e->lm,
+                       data_idx, html, max_output, err);
 }
 
 /* Parses+runs the template and writes the rendered result to out_path via C
@@ -447,7 +809,7 @@ static bool tmg_expand(lua_State *L, const char *in_path, const char *sep, bool 
 bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
                 const char *sep, bool debug)
 {
-    if (!tmg_expand(L, in_path, sep, debug, 0, false, NULL)) return false;
+    if (!tmg_expand(L, in_path, sep, debug, 0, false, 0, NULL)) return false;
 
     const char *result = lua_tostring(L, -1);
     bool success = false;
@@ -467,7 +829,7 @@ bool tmg_render(lua_State *L, const char *in_path, const char *out_path,
 bool tmg_render_string(lua_State *L, const char *in_path, const char *sep, bool debug,
                        bool html)
 {
-    return tmg_expand(L, in_path, sep, debug, 0, html, NULL);
+    return tmg_expand(L, in_path, sep, debug, 0, html, 0, NULL);
 }
 
 /* ---- TMG_LIB_PATH ---------------------------------------------------------- */
@@ -686,6 +1048,7 @@ static int l_tmg_render_string(lua_State *L) {
     bool debug = resolve_debug(L);
     int data_idx = lua_isnoneornil(L, 3) ? 0 : 3;
     bool html = false;
+    size_t max_output = 0;
 
     if (lua_isboolean(L, 4)) {
         html = lua_toboolean(L, 4) != 0;
@@ -699,10 +1062,17 @@ static int l_tmg_render_string(lua_State *L) {
             if (!lua_isnil(L, -1)) html = lua_toboolean(L, -1) != 0;
         }
         lua_pop(L, 1);
+
+        lua_getfield(L, 4, "max_output");
+        if (lua_isnumber(L, -1)) {
+            lua_Integer v = lua_tointeger(L, -1);
+            if (v > 0) max_output = (size_t)v;
+        }
+        lua_pop(L, 1);
     }
 
     str_t err = str_init(64);
-    if (tmg_expand(L, in_path, sep, debug, data_idx, html, &err)) {
+    if (tmg_expand(L, in_path, sep, debug, data_idx, html, max_output, &err)) {
         str_deinit(&err);
         return 1;
     }
@@ -810,6 +1180,9 @@ int main(int argc, char **argv)
     luaL_requiref(L, "http", luaopen_http, 1);
     lua_pop(L, 1);
 
+    luaL_requiref(L, "uv", luaopen_uv, 1);
+    lua_pop(L, 1);
+
     int exit_code = EXIT_SUCCESS;
 
     lua_pushcfunction(L, msghandler);
@@ -834,10 +1207,13 @@ int main(int argc, char **argv)
             http_state_run(L);
         }
     }
-    http_state_deinit(L);
+    bool runtime_closed = http_state_deinit(L);
     lua_remove(L, msgh_idx);
 
-    lua_close(L);
+    if (runtime_closed)
+        lua_close(L);
+    else
+        fprintf(stderr, "ERR: not closing Lua state while libuv handles remain\n");
     cleanup_args(opt);
     return exit_code;
 }

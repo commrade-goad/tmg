@@ -1,5 +1,6 @@
 #include "http.h"
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -377,6 +378,13 @@ static void ws_flush(http_ws_t *ws) {
 
     char *buf = ws->out.data;
     size_t len = ws->out.len;
+    if (len > UINT_MAX) {
+        http_log("websocket write exceeds libuv buffer limit");
+        ws->closing = true;
+        ws->close_after_write = true;
+        http_conn_close(c);
+        return;
+    }
     ws->out = str_init(256);
     ws->write_buf = buf;
     ws->writing = true;
@@ -641,6 +649,12 @@ static int l_ws_is_open(lua_State *L) {
 
 static int l_ws_gc(lua_State *L) {
     http_ws_t *ws = (http_ws_t *)luaL_checkudata(L, 1, HTTP_WS_MT);
+    if (ws->writing) {
+        /* The libuv write owns the buffer until ws_write_cb() runs. */
+        ws->conn = NULL;
+        ws->cleanup_pending = true;
+        return 0;
+    }
     ws_cleanup_now(ws);
     return 0;
 }

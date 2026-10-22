@@ -1,4 +1,5 @@
 #include "http.h"
+#include "uv_module.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -19,7 +20,7 @@ static void conn_free(http_conn_t *c);
 static void timer_cb(uv_timer_t *t);
 
 void http_conn_timer_set(http_conn_t *c, unsigned mode, unsigned timeout_secs) {
-    if (!c || !c->timer_init) return;
+    if (!c || !c->timer_init || c->timer_closing) return;
     if (timeout_secs > 0) {
         c->timer_mode = mode;
         uv_timer_start(&c->timer, timer_cb, (uint64_t)timeout_secs * 1000, 0);
@@ -60,7 +61,7 @@ static int on_message_begin(llhttp_t *p) {
 static int on_url(llhttp_t *p, const char *at, size_t len) {
     http_conn_t *c = conn_of(p);
     size_t max = c->state->cfg.max_url;
-    if (max && c->url.len + len > max) {
+    if (max && (c->url.len > max || len > max - c->url.len)) {
         c->limit_status = 414;
         llhttp_set_error_reason(p, "request URL too long");
         return -1;
@@ -78,7 +79,8 @@ static int on_header_field(llhttp_t *p, const char *at, size_t len) {
         llhttp_set_error_reason(p, "too many headers");
         return -1;
     }
-    if (c->header_bytes + len > c->state->cfg.max_header_bytes) {
+    size_t max = c->state->cfg.max_header_bytes;
+    if (max && (c->header_bytes > max || len > max - c->header_bytes)) {
         c->limit_status = 431;
         llhttp_set_error_reason(p, "header bytes limit exceeded");
         return -1;
@@ -90,7 +92,8 @@ static int on_header_field(llhttp_t *p, const char *at, size_t len) {
 
 static int on_header_value(llhttp_t *p, const char *at, size_t len) {
     http_conn_t *c = conn_of(p);
-    if (c->header_bytes + len > c->state->cfg.max_header_bytes) {
+    size_t max = c->state->cfg.max_header_bytes;
+    if (max && (c->header_bytes > max || len > max - c->header_bytes)) {
         c->limit_status = 431;
         llhttp_set_error_reason(p, "header bytes limit exceeded");
         return -1;
@@ -177,7 +180,7 @@ static int on_headers_complete(llhttp_t *p) {
 static int on_body(llhttp_t *p, const char *at, size_t len) {
     http_conn_t *c = conn_of(p);
     size_t max = c->state->cfg.max_body;
-    if (max && c->body.len + len > max) {
+    if (max && (c->body.len > max || len > max - c->body.len)) {
         c->limit_status = 413;
         llhttp_set_error_reason(p, "request body too large");
         return -1;
@@ -291,13 +294,10 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
 
 void http_conn_write_cb(uv_write_t *req, int status) {
     http_conn_t *c = (http_conn_t *)req->data;
-    c->writing = false;
-    free(c->write_buf);
-    c->write_buf = NULL;
-    c->write_len = 0;
-    http_conn_timer_set(c, HTTP_TIMER_NONE, 0);
+    http_conn_write_cleanup(c);
 
-    if (c->closing) return;
+    if (!http_conn_write_release(c))
+        return;
     if (status < 0) {
         http_log("write error: %s", uv_strerror(status));
         http_conn_close(c);
@@ -335,8 +335,13 @@ static void timer_cb(uv_timer_t *t) {
         c->timed_out = false;
         return;
     }
-    if (c->timer_mode == HTTP_TIMER_HANDLER || c->handler_running ||
-        c->timer_mode == HTTP_TIMER_WRITE || c->writing) {
+    if (c->timer_mode == HTTP_TIMER_STATIC) {
+        http_log("static read timeout for %s", c->remote);
+        http_conn_close(c);
+    } else if (c->timer_mode == HTTP_TIMER_WRITE || c->writing) {
+        http_log("write timeout for %s", c->remote);
+        http_conn_close(c);
+    } else if (c->timer_mode == HTTP_TIMER_HANDLER || c->handler_running) {
         http_conn_send_error(c, 504, http_status_reason(504));
     } else if (!c->message_complete) {
         http_conn_send_error(c, 408, http_status_reason(408));
@@ -374,6 +379,7 @@ static void conn_free(http_conn_t *c) {
 
     http_response_detach_all(c);
     http_ws_cleanup(c);
+    http_static_cleanup(c);
     free(c->method);
     free(c->version);
     free(c->write_buf);
@@ -387,12 +393,30 @@ static void conn_free(http_conn_t *c) {
     free(c);
 }
 
+bool http_conn_release_ref(http_conn_t *c) {
+    if (!c) return false;
+    if (c->close_refs > 0)
+        c->close_refs--;
+    if (c->closing && c->close_refs == 0) {
+        conn_free(c);
+        return false;
+    }
+    return true;
+}
+
 void http_conn_close(http_conn_t *c) {
     if (!c || c->closing) return;
     c->closing = true;
     http_response_detach_all(c);
     stop_reading(c);
     http_ws_disconnect(c);
+
+    /* uv_close() cancels pending writes, but the callback still needs a live
+     * connection.  Hold one close reference until http_conn_write_cb runs. */
+    if (c->writing && !c->write_close_ref) {
+        c->write_close_ref = true;
+        c->close_refs++;
+    }
 
     if (c->timer_init && !c->timer_closing) {
         c->timer_closing = true;
@@ -405,6 +429,7 @@ void http_conn_close(http_conn_t *c) {
         c->close_refs++;
         uv_close((uv_handle_t *)&c->handle, on_handle_close);
     }
+    http_static_cancel(c);
     if (c->close_refs == 0)
         conn_free(c);
 }
@@ -447,6 +472,7 @@ static void on_new_connection(uv_stream_t *server, int status) {
     }
     c->state = st;
     c->status = 200;
+    c->static_fd = -1;
     c->url = str_init(128);
     c->header_field = str_init(32);
     c->header_value = str_init(32);
@@ -510,7 +536,10 @@ static void on_new_connection(uv_stream_t *server, int status) {
 }
 
 static void on_server_close(uv_handle_t *h) {
-    (void)h;
+    http_state_t *st = (http_state_t *)h->data;
+    if (!st) return;
+    st->server_init = false;
+    st->server_closing = false;
 }
 
 static void close_server(http_state_t *st) {
@@ -518,6 +547,15 @@ static void close_server(http_state_t *st) {
         st->server_closing = true;
         uv_close((uv_handle_t *)&st->server, on_server_close);
     }
+}
+
+static bool drain_server_close(http_state_t *st) {
+    if (!st || !st->loop) return true;
+    if (st->server_init && !st->server_closing)
+        close_server(st);
+    for (int i = 0; st->server_closing && i < 100; i++)
+        uv_run(st->loop, UV_RUN_NOWAIT);
+    return !st->server_closing;
 }
 
 static void close_signals(http_state_t *st) {
@@ -570,10 +608,16 @@ int http_state_start(lua_State *L, http_state_t *st) {
         http_settings_ready = true;
     }
 
-    st->loop = uv_default_loop();
+    if (!st->loop)
+        st->loop = uv_default_loop();
     if (!st->loop) {
         http_log("failed to create libuv loop");
         return UV_ENOMEM;
+    }
+
+    if (!drain_server_close(st)) {
+        http_log("previous server handle is still closing");
+        return UV_EBUSY;
     }
 
     if (uv_tcp_init(st->loop, &st->server) != 0)
@@ -600,6 +644,7 @@ int http_state_start(lua_State *L, http_state_t *st) {
     if (rc != 0) {
         http_log("bind failed on %s:%d: %s", host, st->cfg.port, uv_strerror(rc));
         close_server(st);
+        drain_server_close(st);
         return rc;
     }
 
@@ -607,6 +652,7 @@ int http_state_start(lua_State *L, http_state_t *st) {
     if (rc != 0) {
         http_log("listen failed: %s", uv_strerror(rc));
         close_server(st);
+        drain_server_close(st);
         return rc;
     }
 
@@ -649,11 +695,26 @@ void http_state_run(lua_State *L) {
     st->listening = false;
 }
 
-void http_state_deinit(lua_State *L) {
+bool http_state_deinit(lua_State *L) {
     http_state_t *st = http_state_get(L);
-    if (!st) return;
+    if (!st) return true;
+    if (st->deinitialized) return true;
 
+    if (!st->loop)
+        st->loop = uv_default_loop();
+    tmg_uv_shutdown(L);
     http_state_stop(st);
+
+    /* Program teardown must not wait forever for a slow client.  Force-close
+     * every remaining connection; pending write callbacks are accounted for by
+     * http_conn_close() before the handles are drained below. */
+    for (http_conn_t *c = st->conns; c; c = c->next) {
+        if (!c->closing)
+            http_conn_close(c);
+    }
+
+    if (st->loop)
+        uv_run(st->loop, UV_RUN_DEFAULT);
 
     for (size_t i = 0; i < st->nroutes; i++) {
         if (st->routes[i].handler_ref != LUA_NOREF)
@@ -669,29 +730,34 @@ void http_state_deinit(lua_State *L) {
     st->nstatics = 0;
     st->cstatics = 0;
 
+    tmg_template_cache_free(st->template_cache, L);
+    st->template_cache = NULL;
+
     free(st->cfg.host);
     free(st->cfg.upload_dir);
     free(st->cfg.template_root);
     memset(&st->cfg, 0, sizeof(st->cfg));
 
+    int rc = 0;
     if (st->loop) {
-        int attempts = 0;
-        int rc;
-        do {
-            uv_run(st->loop, UV_RUN_NOWAIT);
+        for (int attempts = 0; attempts < 16; attempts++) {
             rc = uv_loop_close(st->loop);
-            if (rc == UV_EBUSY) {
-                uv_walk(st->loop, close_walk_cb, NULL);
-                uv_run(st->loop, UV_RUN_DEFAULT);
-            }
-            attempts++;
-        } while (rc == UV_EBUSY && attempts < 16);
+            if (rc != UV_EBUSY) break;
+            uv_walk(st->loop, close_walk_cb, NULL);
+            uv_run(st->loop, UV_RUN_DEFAULT);
+        }
         if (rc != 0) {
             http_log("uv_loop_close failed: %s", uv_strerror(rc));
-        } else {
-            st->loop = NULL;
+            st->server_init = false;
+            st->listening = false;
+            return false;
         }
+        st->loop = NULL;
     }
     st->server_init = false;
+    st->server_closing = false;
     st->listening = false;
+    st->stopping = true;
+    st->deinitialized = true;
+    return true;
 }

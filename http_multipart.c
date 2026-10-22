@@ -115,6 +115,7 @@ static bool parse_part_headers(const char *headers, size_t hlen, char **field,
     char *copy = http_strndup(headers, hlen);
     if (!copy) return false;
 
+    bool headers_ok = true;
     char *line = copy;
     while (line && *line) {
         char *next = strstr(line, "\r\n");
@@ -129,7 +130,7 @@ static bool parse_part_headers(const char *headers, size_t hlen, char **field,
             }
         }
         char *colon = strchr(line, ':');
-        if (colon) {
+        if (colon && colon != line) {
             *colon = '\0';
             char *name = trim_dup(line);
             char *value = trim_dup(colon + 1);
@@ -147,12 +148,14 @@ static bool parse_part_headers(const char *headers, size_t hlen, char **field,
             }
             free(name);
             free(value);
+        } else {
+            headers_ok = false;
         }
         line = next;
     }
 
     free(copy);
-    return (*field != NULL);
+    return headers_ok && *field != NULL;
 }
 
 static uint64_t upload_counter = 0;
@@ -184,6 +187,20 @@ static void set_field(lua_State *L, int tidx, const char *k, size_t klen,
     lua_settable(L, tidx);
 }
 
+static void cleanup_uploads(lua_State *L, int files_idx) {
+    size_t n = (size_t)lua_objlen(L, files_idx);
+    for (size_t i = 1; i <= n; i++) {
+        lua_rawgeti(L, files_idx, (int)i);
+        if (lua_istable(L, -1)) {
+            lua_getfield(L, -1, "path");
+            if (lua_isstring(L, -1))
+                unlink(lua_tostring(L, -1));
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+    }
+}
+
 bool http_multipart_parse(http_conn_t *c, lua_State *L, int form_idx,
                           int files_idx) {
     if (!c || !L) return false;
@@ -211,13 +228,20 @@ bool http_multipart_parse(http_conn_t *c, lua_State *L, int form_idx,
     }
 
     size_t pos = found + marker.len;
-    int parts = 0;
-    int file_count = 0;
+    size_t max_parts = c->state ? c->state->cfg.max_multipart_parts : 64;
+    size_t max_files = c->state ? c->state->cfg.max_multipart_files : 32;
+    if (max_parts == 0) max_parts = 64;
+    if (max_files == 0) max_files = 32;
+    size_t parts = 0;
+    size_t file_count = 0;
     bool ok = true;
+    bool final = false;
 
     while (pos <= len) {
-        if (pos + 2 <= len && data[pos] == '-' && data[pos + 1] == '-')
-            break; /* final boundary */
+        if (pos + 2 <= len && data[pos] == '-' && data[pos + 1] == '-') {
+            final = true;
+            break;
+        }
 
         if (pos + 2 <= len && data[pos] == '\r' && data[pos + 1] == '\n')
             pos += 2;
@@ -274,7 +298,7 @@ bool http_multipart_parse(http_conn_t *c, lua_State *L, int form_idx,
             break;
         }
 
-        if (++parts > 64) {
+        if (++parts > max_parts) {
             free(field);
             free(filename);
             free(ctype);
@@ -284,7 +308,7 @@ bool http_multipart_parse(http_conn_t *c, lua_State *L, int form_idx,
         }
 
         if (filename && *filename) {
-            if (++file_count > 32) {
+            if (++file_count > max_files) {
                 free(field);
                 free(filename);
                 free(ctype);
@@ -343,6 +367,11 @@ bool http_multipart_parse(http_conn_t *c, lua_State *L, int form_idx,
 
         pos = next + dlen;
     }
+
+    if (ok && !final)
+        ok = false;
+    if (!ok)
+        cleanup_uploads(L, files_idx);
 
     str_deinit(&boundary);
     str_deinit(&marker);

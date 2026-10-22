@@ -35,12 +35,34 @@ http.get("/set-cookie", function(req, res)
     res:send("cookie set")
 end)
 
+http.get("/cookie-invalid", function(req, res)
+    local ok, err = pcall(function()
+        res:cookie("session_id", "abc123", { secure = "yes" })
+    end)
+    res:send(ok and "unexpected" or tostring(err))
+end)
+
 http.get("/echo-cookie", function(req, res)
     res:send(req.cookies.session_id or "missing")
 end)
 
 http.post("/form", function(req, res)
     res:send((req.form.name or "?") .. ":" .. (req.form.age or "?"))
+end)
+
+http.get("/render-cache", function(req, res)
+    res:render("cache_test.tmg", { name = "cache" })
+end)
+
+http.get("/cache-clear", function(req, res)
+    http.template_cache_clear()
+    res:send("cleared")
+end)
+
+http.get("/cache-stats", function(req, res)
+    local s = http.template_cache_stats()
+    res:send(string.format("%s,%d,%d,%d,%d,%d", s.mode, s.entries,
+                            s.hits, s.misses, s.reloads, s.evictions))
 end)
 
 http.post("/upload", function(req, res)
@@ -81,7 +103,11 @@ http.get("/use-stale-response", function(req, res)
 end)
 
 http.get("/too-large-response", function(req, res)
-    res:send(string.rep("x", 8192))
+    res:send(string.rep("x", 300 * 1024))
+end)
+
+http.get("/render-too-large", function(req, res)
+    res:render("hello.tmg", { name = string.rep("x", 300 * 1024) })
 end)
 
 http.ws("/ws/:room", function(ws, req)
@@ -116,7 +142,7 @@ local ok = http.listen({
     port = 18080,
     max_body = 2 * 1024 * 1024,
     max_static_size = 1024 * 1024,
-    max_response = 4096,
+    max_response = 256 * 1024,
     keepalive_timeout = 1,
     upload_dir = "tests/uploads",
     template_root = "tests/fixtures/templates",

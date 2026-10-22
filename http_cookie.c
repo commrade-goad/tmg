@@ -109,31 +109,66 @@ bool http_cookie_header(http_conn_t *c, const char *name, const char *value,
     int64_t max_age = 0;
     bool has_max_age = false;
 
+    if (opts_idx && !lua_isnoneornil(L, opts_idx) &&
+        !lua_istable(L, opts_idx))
+        luaL_error(L, "cookie: options must be a table");
+
     if (opts_idx && lua_istable(L, opts_idx)) {
         lua_getfield(L, opts_idx, "httponly");
-        if (!lua_isnil(L, -1)) httponly = lua_toboolean(L, -1);
+        if (!lua_isnil(L, -1)) {
+            if (!lua_isboolean(L, -1))
+                luaL_error(L, "cookie: httponly must be a boolean");
+            httponly = lua_toboolean(L, -1);
+        }
         lua_pop(L, 1);
 
         lua_getfield(L, opts_idx, "secure");
-        secure = lua_toboolean(L, -1);
+        if (!lua_isnil(L, -1)) {
+            if (!lua_isboolean(L, -1))
+                luaL_error(L, "cookie: secure must be a boolean");
+            secure = lua_toboolean(L, -1);
+        }
         lua_pop(L, 1);
 
         lua_getfield(L, opts_idx, "path");
-        if (lua_isstring(L, -1)) path = lua_tostring(L, -1);
-        else if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) path = NULL;
+        if (lua_isstring(L, -1)) {
+            path = lua_tostring(L, -1);
+        } else if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
+            path = NULL;
+        } else if (!lua_isnil(L, -1)) {
+            luaL_error(L, "cookie: path must be a string or false");
+        }
         lua_pop(L, 1);
 
         lua_getfield(L, opts_idx, "domain");
-        if (lua_isstring(L, -1)) domain = lua_tostring(L, -1);
+        if (lua_isstring(L, -1)) {
+            domain = lua_tostring(L, -1);
+        } else if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
+            domain = NULL;
+        } else if (!lua_isnil(L, -1)) {
+            luaL_error(L, "cookie: domain must be a string or false");
+        }
         lua_pop(L, 1);
 
         lua_getfield(L, opts_idx, "expires");
-        if (lua_isstring(L, -1)) expires = lua_tostring(L, -1);
+        if (lua_isstring(L, -1)) {
+            expires = lua_tostring(L, -1);
+        } else if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
+            expires = NULL;
+        } else if (!lua_isnil(L, -1)) {
+            luaL_error(L, "cookie: expires must be a string or false");
+        }
         lua_pop(L, 1);
 
         lua_getfield(L, opts_idx, "max_age");
-        if (lua_isnumber(L, -1)) {
-            max_age = (int64_t)lua_tointeger(L, -1);
+        if (!lua_isnil(L, -1)) {
+            if (!lua_isnumber(L, -1))
+                luaL_error(L, "cookie: max_age must be an integer");
+            lua_Number n = lua_tonumber(L, -1);
+            lua_Integer i = lua_tointeger(L, -1);
+            if ((lua_Number)i != n)
+                luaL_error(L, "cookie: max_age must be an integer");
+            max_age = (int64_t)i;
             has_max_age = true;
         }
         lua_pop(L, 1);
@@ -143,6 +178,8 @@ bool http_cookie_header(http_conn_t *c, const char *name, const char *value,
             samesite = lua_tostring(L, -1);
         } else if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
             samesite = NULL;
+        } else if (!lua_isnil(L, -1)) {
+            luaL_error(L, "cookie: samesite must be a string or false");
         }
         lua_pop(L, 1);
     }

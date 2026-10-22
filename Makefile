@@ -56,12 +56,50 @@ $(WSLAY_LIB): | deps
 
 test: tmg
 	python3 tests/test_http.py
+	python3 tests/test_boundaries.py
 	python3 tests/htmx_todo/test.py
+	python3 tests/react_counter/test.py
+	./tmg tests/test_template.lua
+	python3 tests/test_template_sep.py
+	./tmg tests/test_json.lua
+	./tmg tests/test_uv.lua
+	./tmg tests/test_uv_fs.lua
+
+SAN_CC ?= $(shell command -v clang >/dev/null 2>&1 && echo clang || echo gcc)
+asan:
+	$(MAKE) clean
+	$(MAKE) \
+		CC="$(SAN_CC)" \
+		CFLAGS="-std=gnu11 -Wall -Wextra -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined" \
+		LDFLAGS="-Wl,-E -fsanitize=address,undefined" \
+		test
+
+FUZZ_CC ?= clang
+FUZZ_CFLAGS ?= -std=gnu11 -Wall -Wextra -O1 -g -fno-omit-frame-pointer
+FUZZ_SAN ?= -fsanitize=fuzzer,address,undefined
+FUZZ_TIME ?= 30
+FUZZ_WORK ?= /tmp/tmg-fuzz
+FUZZ_BIN = tests/fuzz_http
+FUZZ_SRC = $(SRC)
+
+$(FUZZ_BIN): tests/fuzz_http.c $(FUZZ_SRC) http.h str.h $(LIB_ARCHIVES)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(FUZZ_SAN) -Dmain=tmg_fuzz_main_unused \
+		-I. $(CPPFLAGS) tests/fuzz_http.c $(FUZZ_SRC) -o $@ $(LIBS) $(LDFLAGS)
+
+fuzz: $(FUZZ_BIN)
+	mkdir -p $(FUZZ_WORK)
+	$(FUZZ_BIN) -max_total_time=$(FUZZ_TIME) \
+		-artifact_prefix=$(FUZZ_WORK)/ $(FUZZ_WORK) tests/fuzz_corpus
+
+fuzz-smoke: $(FUZZ_BIN)
+	mkdir -p $(FUZZ_WORK)
+	$(FUZZ_BIN) -runs=2000 -verbosity=0 \
+		-artifact_prefix=$(FUZZ_WORK)/ $(FUZZ_WORK) tests/fuzz_corpus
 
 clean:
-	rm -f $(OBJ) tmg
+	rm -f $(OBJ) tmg $(FUZZ_BIN)
 
 distclean: clean
 	rm -rf $(UV_DIR)/build $(LLHTTP_DIR)/build $(WSLAY_DIR)/build
 
-.PHONY: all test clean distclean
+.PHONY: all test asan fuzz fuzz-smoke clean distclean

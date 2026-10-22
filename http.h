@@ -11,18 +11,23 @@
 #include <uv.h>
 
 #include "str.h"
+#include "template_cache.h"
 
 #define HTTP_STATE_KEY "tmg.http.state"
 #define HTTP_RES_MT "tmg.http.response"
 #define HTTP_REQ_MT "tmg.http.request"
 #define HTTP_SERVER_NAME "tmg"
 #define HTTP_READ_CHUNK 16384
+#define HTTP_JSON_DEFAULT_DEPTH 64
+#define HTTP_JSON_MAX_DEPTH 1024
 #define HTTP_TIMER_NONE 0u
 #define HTTP_TIMER_HEADER 1u
 #define HTTP_TIMER_BODY 2u
 #define HTTP_TIMER_HANDLER 3u
 #define HTTP_TIMER_WRITE 4u
 #define HTTP_TIMER_KEEPALIVE 5u
+#define HTTP_TIMER_STATIC 6u
+#define HTTP_STATIC_CHUNK 65536
 
 typedef struct {
     char *name;
@@ -65,6 +70,10 @@ typedef struct {
     unsigned keepalive_timeout;
     char *upload_dir;
     char *template_root;
+    size_t template_cache_max;
+    size_t max_multipart_parts;
+    size_t max_multipart_files;
+    int template_cache_mode;
     bool debug;
 } http_config_t;
 
@@ -75,6 +84,7 @@ struct http_state {
     bool server_closing;
     bool listening;
     bool stopping;
+    bool deinitialized;
     uv_signal_t sigint;
     uv_signal_t sigterm;
     bool sigint_init;
@@ -86,6 +96,7 @@ struct http_state {
     http_static_t *statics;
     size_t nstatics;
     size_t cstatics;
+    tmg_template_cache_t *template_cache;
     http_conn_t *conns;
     lua_State *L;
 };
@@ -126,8 +137,25 @@ struct http_conn {
     size_t nres_headers;
     size_t cres_headers;
     str_t res_body;
+    size_t res_content_length;
+    bool res_content_length_set;
     bool ended;
+    bool sending_error;
     bool close_after_write;
+
+    /* static file streaming */
+    uv_fs_t static_req;
+    uv_stat_t static_stat;
+    uv_file static_fd;
+    char *static_path;
+    char *static_buf;
+    uint64_t static_size;
+    bool static_fs_active;
+    bool static_fs_ref;
+    bool static_streaming;
+    bool static_headers_sent;
+    bool static_cancel;
+    bool static_head;
 
     /* io */
     bool reading;
@@ -138,8 +166,11 @@ struct http_conn {
     char *write_buf;
     size_t write_len;
     uv_write_t write_req;
+    bool write_close_ref;
     char remote[64];
-    http_res_ud_t *responses;
+    int *res_refs;
+    size_t nres_refs;
+    size_t cres_refs;
     unsigned long req_generation;
     unsigned timer_mode;
 
@@ -175,12 +206,17 @@ bool http_multipart_parse(http_conn_t *c, lua_State *L, int form_idx,
                           int files_idx);
 
 /* json */
-bool http_json_encode(lua_State *L, int idx, str_t *out, int depth);
+bool http_json_encode(lua_State *L, int idx, str_t *out, size_t max_output,
+                      int max_depth);
+bool http_json_decode(lua_State *L, const char *s, size_t len, int max_depth,
+                      str_t *err);
 
 /* static files */
 bool http_static_add(http_state_t *st, const char *prefix, const char *root,
                      str_t *err);
 bool http_static_serve(http_conn_t *c, const char *method, const char *path);
+void http_static_cancel(http_conn_t *c);
+void http_static_cleanup(http_conn_t *c);
 void http_statics_free(http_static_t *statics, size_t n);
 
 /* router */
@@ -205,6 +241,12 @@ int http_response_push(lua_State *L, http_conn_t *c);
 void http_response_detach_all(http_conn_t *c);
 void http_response_reset(http_conn_t *c);
 bool http_conn_send_response(http_conn_t *c);
+bool http_conn_send_stream_head(http_conn_t *c, uv_write_cb cb);
+bool http_conn_write_raw(http_conn_t *c, char *buf, size_t len,
+                         uv_write_cb cb);
+void http_conn_write_cleanup(http_conn_t *c);
+bool http_conn_write_release(http_conn_t *c);
+bool http_conn_release_ref(http_conn_t *c);
 void http_conn_send_error(http_conn_t *c, int status, const char *msg);
 
 /* connection */
@@ -218,7 +260,7 @@ http_state_t *http_state_get(lua_State *L);
 int http_state_start(lua_State *L, http_state_t *st);
 void http_state_stop(http_state_t *st);
 void http_state_run(lua_State *L);
-void http_state_deinit(lua_State *L);
+bool http_state_deinit(lua_State *L);
 
 /* websocket */
 bool http_ws_init(http_conn_t *c, lua_State *L, http_route_t *route,

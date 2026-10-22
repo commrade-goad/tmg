@@ -68,7 +68,12 @@ Hello % tmg.print(data.name) %!
 its vararg, so `local data = ...` works without touching globals. A fourth
 argument, `{ autoescape = true }`, HTML-escapes values emitted by
 `tmg.print`; `tmg.raw(value)` bypasses escaping. CLI `tmg.render(...)` does
-not auto-escape, so LaTeX and other plain-text templates keep working.
+not auto-escape, so LaTeX and other plain-text templates keep working. Pass
+`nil` as `sep` to use `tmg_delim`; an explicit string overrides the global.
+
+`res:render(...)` in the HTTP module has no per-call separator argument, so it
+always uses `tmg_delim` (default `%`). This also applies when
+`template_cache = false`.
 
 Because rendering happens in the same Lua state your build script is
 running in, anything the script `require`s or sets as a global is visible
@@ -130,6 +135,10 @@ http.listen {
     max_static_size = 64 * 1024 * 1024,
     max_ws_message = 10 * 1024 * 1024,
     max_response = 10 * 1024 * 1024,
+    max_multipart_parts = 64,
+    max_multipart_files = 32,
+    template_cache = "development", -- or "production" / false
+    template_cache_max = 256,
     header_timeout = 10,
     body_timeout = 15,
     handler_timeout = 30,
@@ -179,10 +188,43 @@ saved under `upload_dir` and exposed as
 `res:cookie` defaults to `HttpOnly; SameSite=Lax; Path=/`; options include
 `path`, `domain`, `max_age`, `expires`, `secure`, `httponly`, `samesite`.
 
+JSON can also be encoded and decoded without sending a response:
+
+```lua
+local text = http.json_encode({ ok = true, values = { 1, 2 } })
+local value = http.json_decode(text)
+
+local text, err = http.json_encode(value, { max_output = 1024 * 1024 })
+local value, err = http.json_decode(text, { max_depth = 64 })
+```
+
+Encoding uses a dynamically growing buffer with no fixed byte cap;
+`max_output` is an optional cap. `max_depth` defaults to `64`, may be set up to
+`1024`, and is a recursion guard rather than a length limit. Cyclic tables are
+rejected. `http.json_decode` follows RFC 8259, accepts `\uXXXX` escapes and
+surrogate pairs, and rejects malformed or trailing input. JSON `null` becomes
+Lua `nil`, so null array entries are holes and null object values are omitted.
+`res:json(value)` uses the same encoder and is still bounded by
+`max_response`.
+
 `http.static(prefix, root)` maps a URL prefix to a document root. Only
 `GET` and `HEAD` are served, paths are resolved under `root` with `..` and
 symlink-escape checks, directory paths serve `index.html`, and files larger
-than `max_static_size` are rejected. Range requests are not implemented.
+than `max_static_size` are rejected. `GET` responses use real asynchronous
+`Transfer-Encoding: chunked` streaming (64 KiB reads); `HEAD` still returns
+`Content-Length` without a body. Range requests are not implemented.
+
+`res:render` caches compiled templates by default. `template_cache =
+"development"` stats the template on every render and reloads when its
+mtime/size/inode changes; `"production"` reuses the first compiled version;
+`false` disables caching. The cache is LRU-bounded by `template_cache_max`
+(default 256) and is cleared on shutdown. `http.template_cache_clear()` and
+`http.template_cache_stats()` expose cache control and diagnostics.
+
+`max_multipart_parts` and `max_multipart_files` bound multipart requests
+(defaults 64 and 32; `0` restores the default). Repeated fields use the last
+value deterministically, and files written by a partially failed parse are
+removed before the request is rejected.
 
 `res:render` HTML-escapes dynamic values emitted by `tmg.print` by default,
 including values from `data`; literal template markup is untouched. Use
@@ -217,6 +259,73 @@ A session-scoped htmx Todo SPA lives in `tests/htmx_todo/`:
 It serves htmx locally, uses server-rendered fragments, and keeps CRUD state
 in memory per `todo_sid` cookie. `tests/htmx_todo/test.py` covers the full
 create/read/update/delete flow.
+
+A minimal React starter-style counter lives in `tests/react_counter/`:
+
+```sh
+./tmg tests/react_counter/app.lua
+# open http://127.0.0.1:18087
+```
+
+It is just a button and a counter, with no logo or animation. State is kept
+per `counter_sid` cookie, and `tests/react_counter/test.py` covers increments
+and session isolation.
+
+## libuv bridge
+`require("uv")` exposes safe Lua userdata handles over the same default libuv
+loop used by the HTTP server:
+
+```lua
+local uv = require("uv")
+
+local timer = uv.timer()
+timer:start(100, 0, function()
+    timer:close()
+end)
+uv.run()
+```
+
+Timers support `start(timeout_ms, repeat_ms, cb)`, `stop()`, `again()`, and
+`close([cb])`. TCP handles support `bind(host, port)`, `listen(backlog, cb)`,
+`connect(host, port, cb)`, `read_start(cb)`, `read_stop()`,
+`write(data, cb)`, `getsockname()`, `getpeername()`, and `close([cb])`.
+The listen callback receives an accepted client handle. Read callbacks receive
+`(err, data)`; callbacks receive `"EOF"` when the peer closes. Write and connect
+callbacks receive `nil` on success or an error string. Every handle has
+`is_closing()`, `is_active()`, and `is_reading()`; closed handles raise a
+deterministic error. Double `close()` returns `false`.
+
+All handles share `uv_default_loop()` with `http.listen`, so `uv.run()` also
+drives an active HTTP server. Runtime shutdown closes any handles still open
+before the loop and Lua state are destroyed. Applications should still close
+handles they no longer need; dropped handles are closed by `__gc`.
+
+The filesystem bridge follows the luv convention: omit the callback for a
+synchronous call (`value, err`), or pass a callback for an asynchronous call
+(`cb(err, value)`). Async calls return `true` when queued. Available functions
+are `fs_stat`, `fs_lstat`, `fs_open`, `fs_unlink`, `fs_mkdir`, `fs_rmdir`,
+`fs_rename`, `fs_copyfile`, `fs_chmod`, `fs_chown`, `fs_utime`, `fs_realpath`,
+and `fs_scandir`, plus `cwd`, `chdir`, and `exepath`:
+
+```lua
+local uv = require("uv")
+local f = assert(uv.fs_open("data.txt", "r", 0))
+local data = assert(f:read(4096, 0))
+f:close()
+
+uv.fs_stat("data.txt", function(err, st)
+    if not err then print(st.type, st.size, st.mtime) end
+end)
+uv.run()
+```
+
+`fs_open` returns a file userdata with `read`, `write`, `close`, `stat`, `fd`,
+and `is_closing`. Stats include `type`, `size`, mode/ownership fields, and
+`atime`/`mtime`/`ctime`/`birthtime` as seconds plus `_sec`/`_nsec` components.
+Pending asynchronous operations keep their file handles alive; `close()` is
+deferred until callbacks finish. Missing libuv features (UDP, pipes, TTY,
+process/DNS/signals, fs events/polling, random, threadpool, and misc OS APIs)
+are intentionally not exposed yet and are listed as TODOs in `uv_module.h`.
 
 ## Extra library paths
 Set `TMG_LIB_PATH` to a `:`-separated list of directories to make your own
@@ -311,3 +420,17 @@ TMG_LIB_PATH=/path/to/tmg/lib:/dir/with/libs tmg example/raylib-demo.lua
 * `libphysac.so` is optional; without it a warning is printed and the physac
   functions are unavailable. See the binding's README for building it.
 * Set `RAYLIB_LUAJIT_DIR` if the binding lives somewhere else.
+
+## Testing
+`make test` runs the HTTP/WebSocket, boundary-limit, htmx todo, React-style
+counter, template separator, JSON, libuv, and filesystem bridge suites.
+`make asan` rebuilds with AddressSanitizer, UndefinedBehaviorSanitizer, and leak
+detection, then runs the same tests. It uses Clang when available (`SAN_CC`
+overrides the compiler); GCC installations need the matching `libasan`/
+`libubsan` runtime packages.
+
+`make fuzz` builds the libFuzzer harness (`tests/fuzz_http.c`) with Clang and
+runs it for 30 seconds against `tests/fuzz_corpus`. `make fuzz-smoke` runs a
+short 2000-iteration pass suitable for CI. The harness covers percent decoding,
+path safety, filename sanitizing, URL-encoded forms, cookie parsing, and JSON
+decode/encode. Override `FUZZ_TIME`, `FUZZ_CC`, or `FUZZ_SAN` as needed.

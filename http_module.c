@@ -7,25 +7,139 @@
 #include <string.h>
 #include <strings.h>
 
+static void config_defaults(http_config_t *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->host = http_strdup("127.0.0.1");
+    cfg->port = 8080;
+    cfg->max_body = 10 * 1024 * 1024;
+    cfg->max_header_bytes = 64 * 1024;
+    cfg->max_headers = 100;
+    cfg->max_url = 8192;
+    cfg->max_static_size = 64 * 1024 * 1024;
+    cfg->max_ws_message = 10 * 1024 * 1024;
+    cfg->max_response = 10 * 1024 * 1024;
+    cfg->header_timeout = 10;
+    cfg->body_timeout = 15;
+    cfg->handler_timeout = 30;
+    cfg->write_timeout = 30;
+    cfg->keepalive_timeout = 15;
+    cfg->upload_dir = http_strdup("uploads");
+    cfg->template_root = http_strdup(".");
+    cfg->template_cache_mode = TMG_CACHE_DEVELOPMENT;
+    cfg->template_cache_max = 256;
+    cfg->max_multipart_parts = 64;
+    cfg->max_multipart_files = 32;
+    cfg->debug = false;
+}
+
+static void config_free(http_config_t *cfg) {
+    if (!cfg) return;
+    free(cfg->host);
+    free(cfg->upload_dir);
+    free(cfg->template_root);
+    memset(cfg, 0, sizeof(*cfg));
+}
+
 static void state_defaults(http_state_t *st) {
     memset(st, 0, sizeof(*st));
-    st->cfg.host = http_strdup("127.0.0.1");
-    st->cfg.port = 8080;
-    st->cfg.max_body = 10 * 1024 * 1024;
-    st->cfg.max_header_bytes = 64 * 1024;
-    st->cfg.max_headers = 100;
-    st->cfg.max_url = 8192;
-    st->cfg.max_static_size = 64 * 1024 * 1024;
-    st->cfg.max_ws_message = 10 * 1024 * 1024;
-    st->cfg.max_response = 10 * 1024 * 1024;
-    st->cfg.header_timeout = 10;
-    st->cfg.body_timeout = 15;
-    st->cfg.handler_timeout = 30;
-    st->cfg.write_timeout = 30;
-    st->cfg.keepalive_timeout = 15;
-    st->cfg.upload_dir = http_strdup("uploads");
-    st->cfg.template_root = http_strdup(".");
-    st->cfg.debug = false;
+    config_defaults(&st->cfg);
+}
+
+static bool read_config_integer(lua_State *L, int table, const char *name,
+                                lua_Integer *value, bool *present) {
+    lua_getfield(L, table, name);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        *present = false;
+        return true;
+    }
+    if (!lua_isnumber(L, -1)) {
+        lua_pop(L, 1);
+        return false;
+    }
+    lua_Number n = lua_tonumber(L, -1);
+    lua_Integer v = lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    if ((lua_Number)v != n) return false;
+    *value = v;
+    *present = true;
+    return true;
+}
+
+static bool read_size_config(lua_State *L, int table, const char *name,
+                             size_t *target, char *err, size_t errsz) {
+    lua_Integer v = 0;
+    bool present = false;
+    if (!read_config_integer(L, table, name, &v, &present)) {
+        snprintf(err, errsz, "%s must be an integer", name);
+        return false;
+    }
+    if (!present) return true;
+    if (v < 0) {
+        snprintf(err, errsz, "%s must be >= 0", name);
+        return false;
+    }
+    if ((uintmax_t)v > (uintmax_t)SIZE_MAX) {
+        snprintf(err, errsz, "%s is too large", name);
+        return false;
+    }
+    *target = (size_t)v;
+    return true;
+}
+
+static bool read_timeout_config(lua_State *L, int table, const char *name,
+                                unsigned *target, char *err, size_t errsz) {
+    lua_Integer v = 0;
+    bool present = false;
+    if (!read_config_integer(L, table, name, &v, &present)) {
+        snprintf(err, errsz, "%s must be an integer", name);
+        return false;
+    }
+    if (!present) return true;
+    if (v < 0) {
+        snprintf(err, errsz, "%s must be >= 0", name);
+        return false;
+    }
+    if ((uintmax_t)v > (uintmax_t)UINT_MAX) {
+        snprintf(err, errsz, "%s is too large", name);
+        return false;
+    }
+    *target = (unsigned)v;
+    return true;
+}
+
+static bool read_template_cache(lua_State *L, int table, int *mode,
+                                char *err, size_t errsz) {
+    lua_getfield(L, table, "template_cache");
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return true;
+    }
+    if (lua_isboolean(L, -1)) {
+        *mode = lua_toboolean(L, -1) ? TMG_CACHE_DEVELOPMENT : TMG_CACHE_OFF;
+        lua_pop(L, 1);
+        return true;
+    }
+    if (!lua_isstring(L, -1)) {
+        lua_pop(L, 1);
+        snprintf(err, errsz, "template_cache must be a string or boolean");
+        return false;
+    }
+    const char *s = lua_tostring(L, -1);
+    if (strcmp(s, "development") == 0 || strcmp(s, "dev") == 0)
+        *mode = TMG_CACHE_DEVELOPMENT;
+    else if (strcmp(s, "production") == 0 || strcmp(s, "prod") == 0)
+        *mode = TMG_CACHE_PRODUCTION;
+    else if (strcmp(s, "off") == 0 || strcmp(s, "none") == 0)
+        *mode = TMG_CACHE_OFF;
+    else {
+        lua_pop(L, 1);
+        snprintf(err, errsz,
+                 "template_cache must be 'development', 'production', or false");
+        return false;
+    }
+    lua_pop(L, 1);
+    return true;
 }
 
 static http_state_t *ensure_state(lua_State *L) {
@@ -46,116 +160,132 @@ static http_state_t *ensure_state(lua_State *L) {
 
 static int l_http_listen(lua_State *L) {
     http_state_t *st = ensure_state(L);
+    if (st->deinitialized)
+        return luaL_error(L, "http.listen: server is shut down");
     if (st->listening)
         return luaL_error(L, "http.listen: server is already running");
 
     if (!lua_isnoneornil(L, 1))
         luaL_checktype(L, 1, LUA_TTABLE);
 
-    free(st->cfg.host);
-    free(st->cfg.upload_dir);
-    free(st->cfg.template_root);
-    st->cfg.host = http_strdup("127.0.0.1");
-    st->cfg.port = 8080;
-    st->cfg.max_body = 10 * 1024 * 1024;
-    st->cfg.max_header_bytes = 64 * 1024;
-    st->cfg.max_headers = 100;
-    st->cfg.max_url = 8192;
-    st->cfg.max_static_size = 64 * 1024 * 1024;
-    st->cfg.max_ws_message = 10 * 1024 * 1024;
-    st->cfg.max_response = 10 * 1024 * 1024;
-    st->cfg.header_timeout = 10;
-    st->cfg.body_timeout = 15;
-    st->cfg.handler_timeout = 30;
-    st->cfg.write_timeout = 30;
-    st->cfg.keepalive_timeout = 15;
-    st->cfg.upload_dir = http_strdup("uploads");
-    st->cfg.template_root = http_strdup(".");
-    st->cfg.debug = false;
-
-    #define READ_SIZE_FIELD(name, target) do { \
-        lua_getfield(L, 1, name); \
-        if (!lua_isnil(L, -1)) { \
-            lua_Integer v = luaL_checkinteger(L, -1); \
-            if (v < 0) \
-                return luaL_error(L, "http.listen: %s must be >= 0", name); \
-            size_t sv = (size_t)v; \
-            if ((lua_Integer)sv != v) \
-                return luaL_error(L, "http.listen: %s is too large", name); \
-            target = sv; \
-        } \
-        lua_pop(L, 1); \
-    } while (0)
-    #define READ_TIMEOUT_FIELD(name, target) do { \
-        lua_getfield(L, 1, name); \
-        if (!lua_isnil(L, -1)) { \
-            lua_Integer v = luaL_checkinteger(L, -1); \
-            if (v < 0) \
-                return luaL_error(L, "http.listen: %s must be >= 0", name); \
-            unsigned uv = (unsigned)v; \
-            if ((lua_Integer)uv != v) \
-                return luaL_error(L, "http.listen: %s is too large", name); \
-            target = uv; \
-        } \
-        lua_pop(L, 1); \
-    } while (0)
+    http_config_t cfg;
+    config_defaults(&cfg);
+    char err[160] = "";
 
     if (lua_istable(L, 1)) {
         lua_getfield(L, 1, "host");
-        if (lua_isstring(L, -1)) {
-            free(st->cfg.host);
-            st->cfg.host = http_strdup(lua_tostring(L, -1));
+        if (!lua_isnil(L, -1)) {
+            if (!lua_isstring(L, -1)) {
+                lua_pop(L, 1);
+                snprintf(err, sizeof(err), "host must be a string");
+                goto config_error;
+            }
+            free(cfg.host);
+            cfg.host = http_strdup(lua_tostring(L, -1));
         }
         lua_pop(L, 1);
 
-        lua_getfield(L, 1, "port");
-        if (lua_isnumber(L, -1)) {
-            lua_Integer p = lua_tointeger(L, -1);
-            if (p < 0 || p > 65535)
-                return luaL_error(L, "http.listen: invalid port");
-            st->cfg.port = (int)p;
+        lua_Integer p = 0;
+        bool has_port = false;
+        if (!read_config_integer(L, 1, "port", &p, &has_port)) {
+            snprintf(err, sizeof(err), "port must be an integer");
+            goto config_error;
         }
-        lua_pop(L, 1);
+        if (has_port) {
+            if (p < 0 || p > 65535) {
+                snprintf(err, sizeof(err), "invalid port");
+                goto config_error;
+            }
+            cfg.port = (int)p;
+        }
 
-        READ_SIZE_FIELD("max_body", st->cfg.max_body);
-        READ_SIZE_FIELD("max_header_bytes", st->cfg.max_header_bytes);
-        READ_SIZE_FIELD("max_headers", st->cfg.max_headers);
-        READ_SIZE_FIELD("max_url", st->cfg.max_url);
-        READ_SIZE_FIELD("max_static_size", st->cfg.max_static_size);
-        READ_SIZE_FIELD("max_ws_message", st->cfg.max_ws_message);
-        READ_SIZE_FIELD("max_response", st->cfg.max_response);
-        READ_TIMEOUT_FIELD("header_timeout", st->cfg.header_timeout);
-        READ_TIMEOUT_FIELD("body_timeout", st->cfg.body_timeout);
-        READ_TIMEOUT_FIELD("handler_timeout", st->cfg.handler_timeout);
-        READ_TIMEOUT_FIELD("write_timeout", st->cfg.write_timeout);
-        READ_TIMEOUT_FIELD("keepalive_timeout", st->cfg.keepalive_timeout);
+        if (!read_size_config(L, 1, "max_body", &cfg.max_body,
+                              err, sizeof(err)) ||
+            !read_size_config(L, 1, "max_header_bytes", &cfg.max_header_bytes,
+                              err, sizeof(err)) ||
+            !read_size_config(L, 1, "max_headers", &cfg.max_headers,
+                              err, sizeof(err)) ||
+            !read_size_config(L, 1, "max_url", &cfg.max_url,
+                              err, sizeof(err)) ||
+            !read_size_config(L, 1, "max_static_size", &cfg.max_static_size,
+                              err, sizeof(err)) ||
+            !read_size_config(L, 1, "max_ws_message", &cfg.max_ws_message,
+                              err, sizeof(err)) ||
+            !read_size_config(L, 1, "max_response", &cfg.max_response,
+                              err, sizeof(err)) ||
+            !read_size_config(L, 1, "template_cache_max",
+                              &cfg.template_cache_max, err, sizeof(err)) ||
+            !read_size_config(L, 1, "max_multipart_parts",
+                              &cfg.max_multipart_parts, err, sizeof(err)) ||
+            !read_size_config(L, 1, "max_multipart_files",
+                              &cfg.max_multipart_files, err, sizeof(err)) ||
+            !read_timeout_config(L, 1, "header_timeout", &cfg.header_timeout,
+                                 err, sizeof(err)) ||
+            !read_timeout_config(L, 1, "body_timeout", &cfg.body_timeout,
+                                 err, sizeof(err)) ||
+            !read_timeout_config(L, 1, "handler_timeout", &cfg.handler_timeout,
+                                 err, sizeof(err)) ||
+            !read_timeout_config(L, 1, "write_timeout", &cfg.write_timeout,
+                                 err, sizeof(err)) ||
+            !read_timeout_config(L, 1, "keepalive_timeout", &cfg.keepalive_timeout,
+                                 err, sizeof(err)))
+            goto config_error;
 
         lua_getfield(L, 1, "upload_dir");
-        if (lua_isstring(L, -1)) {
-            free(st->cfg.upload_dir);
-            st->cfg.upload_dir = http_strdup(lua_tostring(L, -1));
+        if (!lua_isnil(L, -1)) {
+            if (!lua_isstring(L, -1)) {
+                lua_pop(L, 1);
+                snprintf(err, sizeof(err), "upload_dir must be a string");
+                goto config_error;
+            }
+            free(cfg.upload_dir);
+            cfg.upload_dir = http_strdup(lua_tostring(L, -1));
         }
         lua_pop(L, 1);
 
         lua_getfield(L, 1, "template_root");
-        if (lua_isstring(L, -1)) {
-            free(st->cfg.template_root);
-            st->cfg.template_root = http_strdup(lua_tostring(L, -1));
+        if (!lua_isnil(L, -1)) {
+            if (!lua_isstring(L, -1)) {
+                lua_pop(L, 1);
+                snprintf(err, sizeof(err), "template_root must be a string");
+                goto config_error;
+            }
+            free(cfg.template_root);
+            cfg.template_root = http_strdup(lua_tostring(L, -1));
         }
         lua_pop(L, 1);
 
+        if (!read_template_cache(L, 1, &cfg.template_cache_mode,
+                                 err, sizeof(err)))
+            goto config_error;
+
         lua_getfield(L, 1, "debug");
-        if (!lua_isnil(L, -1)) st->cfg.debug = lua_toboolean(L, -1);
+        if (!lua_isnil(L, -1)) cfg.debug = lua_toboolean(L, -1);
         lua_pop(L, 1);
     }
 
-    if (st->cfg.max_header_bytes == 0) st->cfg.max_header_bytes = 64 * 1024;
-    if (st->cfg.max_headers == 0) st->cfg.max_headers = 100;
-    if (st->cfg.max_url == 0) st->cfg.max_url = 8192;
-    if (st->cfg.max_response == 0) st->cfg.max_response = 10 * 1024 * 1024;
+    if (cfg.max_header_bytes == 0) cfg.max_header_bytes = 64 * 1024;
+    if (cfg.max_headers == 0) cfg.max_headers = 100;
+    if (cfg.max_url == 0) cfg.max_url = 8192;
+    if (cfg.max_response == 0) cfg.max_response = 10 * 1024 * 1024;
+    if (cfg.template_cache_max == 0) cfg.template_cache_max = 256;
+    if (cfg.max_multipart_parts == 0) cfg.max_multipart_parts = 64;
+    if (cfg.max_multipart_files == 0) cfg.max_multipart_files = 32;
 
-    #undef READ_SIZE_FIELD
-    #undef READ_TIMEOUT_FIELD
+    if (!st->template_cache) {
+        st->template_cache = tmg_template_cache_create(cfg.template_cache_mode,
+                                                       cfg.template_cache_max);
+        if (!st->template_cache) {
+            snprintf(err, sizeof(err), "out of memory");
+            goto config_error;
+        }
+    } else {
+        tmg_template_cache_set(st->template_cache, L, cfg.template_cache_mode,
+                               cfg.template_cache_max);
+    }
+
+    config_free(&st->cfg);
+    st->cfg = cfg;
 
     int rc = http_state_start(L, st);
     if (rc != 0)
@@ -163,6 +293,10 @@ static int l_http_listen(lua_State *L) {
 
     lua_pushboolean(L, 1);
     return 1;
+
+config_error:
+    config_free(&cfg);
+    return luaL_error(L, "http.listen: %s", err);
 }
 
 static int l_http_stop(lua_State *L) {
@@ -170,6 +304,18 @@ static int l_http_stop(lua_State *L) {
     http_state_stop(st);
     lua_pushboolean(L, 1);
     return 1;
+}
+
+static int l_http_template_cache_clear(lua_State *L) {
+    http_state_t *st = ensure_state(L);
+    tmg_template_cache_clear(st->template_cache, L);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_http_template_cache_stats(lua_State *L) {
+    http_state_t *st = ensure_state(L);
+    return tmg_template_cache_stats(L, st->template_cache);
 }
 
 static int l_http_static(lua_State *L) {
@@ -220,6 +366,98 @@ static int l_http_route(lua_State *L) {
     int rc = route_common(L, method);
     free(method);
     return rc;
+}
+
+static bool json_read_options(lua_State *L, int idx, size_t *max_output,
+                              int *max_depth, char *err, size_t errsz) {
+    *max_output = 0;
+    *max_depth = HTTP_JSON_DEFAULT_DEPTH;
+    if (lua_isnoneornil(L, idx)) return true;
+    if (!lua_istable(L, idx)) {
+        snprintf(err, errsz, "options must be a table");
+        return false;
+    }
+
+    lua_Integer v = 0;
+    bool present = false;
+    if (!read_config_integer(L, idx, "max_output", &v, &present)) {
+        snprintf(err, errsz, "max_output must be an integer");
+        return false;
+    }
+    if (present) {
+        if (v < 0) {
+            snprintf(err, errsz, "max_output must be >= 0");
+            return false;
+        }
+        *max_output = (size_t)v;
+    }
+
+    if (!read_config_integer(L, idx, "max_depth", &v, &present)) {
+        snprintf(err, errsz, "max_depth must be an integer");
+        return false;
+    }
+    if (present) {
+        if (v < 1) {
+            snprintf(err, errsz, "max_depth must be >= 1");
+            return false;
+        }
+        if (v > HTTP_JSON_MAX_DEPTH) {
+            snprintf(err, errsz, "max_depth is too large");
+            return false;
+        }
+        *max_depth = (int)v;
+    }
+    return true;
+}
+
+static int l_http_json_encode(lua_State *L) {
+    luaL_checkany(L, 1);
+    size_t max_output = 0;
+    int max_depth = HTTP_JSON_DEFAULT_DEPTH;
+    char err[160] = "";
+    if (!json_read_options(L, 2, &max_output, &max_depth, err, sizeof(err))) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "http.json_encode: %s", err);
+        return 2;
+    }
+
+    str_t out = str_init(64);
+    if (!http_json_encode(L, 1, &out, max_output, max_depth)) {
+        str_deinit(&out);
+        lua_pushnil(L);
+        lua_pushstring(L, "json: unsupported value, cycle, or too deeply nested");
+        return 2;
+    }
+    lua_pushlstring(L, out.data, out.len);
+    str_deinit(&out);
+    return 1;
+}
+
+static int l_http_json_decode(lua_State *L) {
+    size_t len = 0;
+    const char *s = luaL_checklstring(L, 1, &len);
+    size_t max_output = 0;
+    int max_depth = HTTP_JSON_DEFAULT_DEPTH;
+    char err[160] = "";
+    if (!json_read_options(L, 2, &max_output, &max_depth, err, sizeof(err))) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "http.json_decode: %s", err);
+        return 2;
+    }
+    (void)max_output;
+
+    int top = lua_gettop(L);
+    str_t decode_err = str_init(64);
+    if (!http_json_decode(L, s, len, max_depth, &decode_err)) {
+        lua_settop(L, top);
+        const char *msg = decode_err.len ? decode_err.data : "invalid JSON";
+        lua_pushnil(L);
+        lua_pushlstring(L, msg, decode_err.len ? decode_err.len : strlen(msg));
+        str_deinit(&decode_err);
+        return 2;
+    }
+    str_deinit(&decode_err);
+    return 1;
 }
 
 static int http_msghandler(lua_State *L) {
@@ -361,8 +599,12 @@ int http_dispatch(http_conn_t *c) {
 static const luaL_Reg http_lib[] = {
     {"listen", l_http_listen},
     {"stop", l_http_stop},
+    {"template_cache_clear", l_http_template_cache_clear},
+    {"template_cache_stats", l_http_template_cache_stats},
     {"static", l_http_static},
     {"route", l_http_route},
+    {"json_encode", l_http_json_encode},
+    {"json_decode", l_http_json_decode},
     {"get", l_http_get},
     {"post", l_http_post},
     {"put", l_http_put},

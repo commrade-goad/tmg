@@ -15,8 +15,8 @@ PORT = 18080
 HOST = "127.0.0.1"
 
 
-def request(method, path, body=None, headers=None):
-    conn = http.client.HTTPConnection(HOST, PORT, timeout=5)
+def request(method, path, body=None, headers=None, port=PORT):
+    conn = http.client.HTTPConnection(HOST, port, timeout=5)
     conn.request(method, path, body=body, headers=headers or {})
     resp = conn.getresponse()
     data = resp.read()
@@ -25,12 +25,12 @@ def request(method, path, body=None, headers=None):
     return resp.status, hdrs, data
 
 
-def wait_ready(proc):
+def wait_ready(proc, port=PORT):
     for _ in range(100):
         if proc.poll() is not None:
             raise RuntimeError("server exited early")
         try:
-            status, _, _ = request("GET", "/health")
+            status, _, _ = request("GET", "/health", port=port)
             if status == 200:
                 return
         except OSError:
@@ -39,8 +39,8 @@ def wait_ready(proc):
     raise RuntimeError("server did not become ready")
 
 
-def raw_exchange(payload):
-    s = socket.create_connection((HOST, PORT), timeout=5)
+def raw_exchange(payload, port=PORT):
+    s = socket.create_connection((HOST, port), timeout=5)
     s.sendall(payload)
     data = b""
     while True:
@@ -168,6 +168,17 @@ def main():
         status, _, body = request("GET", "/echo-cookie", headers={"Cookie": "session_id=abc123"})
         check(status == 200 and body == b"abc123", "cookie parsing failed")
 
+        status, _, body = request(
+            "GET", "/echo-cookie",
+            headers={"Cookie": "session_id=first; session_id=second"},
+        )
+        check(status == 200 and body == b"second",
+              "duplicate cookie should be deterministic")
+
+        status, _, body = request("GET", "/cookie-invalid")
+        check(status == 200 and b"secure must be a boolean" in body,
+              "invalid cookie option should be rejected: " + repr(body))
+
         form = b"name=Ada&age=36"
         status, _, body = request(
             "POST", "/form", body=form,
@@ -199,8 +210,102 @@ def main():
         with open(path, "rb") as f:
             check(f.read() == file_data, "uploaded file contents mismatch")
 
+        uploads_dir = os.path.join(ROOT, "tests", "uploads")
+        upload_count = len(os.listdir(uploads_dir))
+        truncated = (
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="upload"; filename="partial.txt"\r\n'
+            b"Content-Type: text/plain\r\n\r\n" + file_data + b"\r\n"
+            b"--" + boundary.encode() + b"\r\n"
+        )
+        status, _, _ = request(
+            "POST", "/upload", body=truncated,
+            headers={"Content-Type": "multipart/form-data; boundary=" + boundary},
+        )
+        check(status == 400, "truncated multipart should be 400")
+        check(len(os.listdir(uploads_dir)) == upload_count,
+              "truncated multipart should clean up uploaded files")
+
+        repeated = (
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="name"\r\n\r\nfirst\r\n'
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="name"\r\n\r\nsecond\r\n'
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="age"\r\n\r\n36\r\n'
+            b"--" + boundary.encode() + b"--\r\n"
+        )
+        status, _, body = request(
+            "POST", "/form", body=repeated,
+            headers={"Content-Type": "multipart/form-data; boundary=" + boundary},
+        )
+        check(status == 200 and body == b"second:36",
+              "repeated multipart field should use the last value")
+
+        too_many = b"".join(
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="n"\r\n\r\nx\r\n'
+            for _ in range(65)
+        ) + b"--" + boundary.encode() + b"--\r\n"
+        status, _, _ = request(
+            "POST", "/form", body=too_many,
+            headers={"Content-Type": "multipart/form-data; boundary=" + boundary},
+        )
+        check(status == 400, "multipart part limit should be enforced")
+
         status, _, body = request("GET", "/render")
         check(status == 200 and body == b"\nHello TMG!\n", "template render failed: " + repr(body))
+
+        cache_tpl = os.path.join(ROOT, "tests", "fixtures", "templates",
+                                 "cache_test.tmg")
+        with open(cache_tpl, "w") as f:
+            f.write("% local data = ... %v1:% tmg.print(data.name) %")
+        try:
+            request("GET", "/cache-clear")
+
+            def cache_stats():
+                _, _, data = request("GET", "/cache-stats")
+                fields = data.decode().split(",")
+                return fields[0], [int(v) for v in fields[1:]]
+
+            mode, s0 = cache_stats()
+            check(mode == "development" and s0[0] == 0,
+                  "cache clear failed: %r" % ((mode, s0),))
+
+            status, _, body = request("GET", "/render-cache")
+            check(status == 200 and body == b"v1:cache",
+                  "cached template first render failed: " + repr(body))
+            _, s1 = cache_stats()
+            check(s1[0] == 1 and s1[2] == s0[2] + 1,
+                  "cache miss not recorded: %r" % (s1,))
+
+            status, _, body = request("GET", "/render-cache")
+            check(status == 200 and body == b"v1:cache",
+                  "cached template second render failed")
+            _, s2 = cache_stats()
+            check(s2[0] == 1 and s2[1] == s1[1] + 1,
+                  "cache hit not recorded: %r" % (s2,))
+
+            with open(cache_tpl, "w") as f:
+                f.write("% local data = ... %v2:% tmg.print(data.name) %")
+            stamp = time.time_ns()
+            os.utime(cache_tpl, ns=(stamp + 1000000000, stamp + 1000000000))
+
+            status, _, body = request("GET", "/render-cache")
+            check(status == 200 and body == b"v2:cache",
+                  "template reload failed: " + repr(body))
+            _, s3 = cache_stats()
+            check(s3[0] == 1 and s3[3] == s2[3] + 1,
+                  "cache reload not recorded: %r" % (s3,))
+
+            os.unlink(cache_tpl)
+            status, _, _ = request("GET", "/render-cache")
+            check(status == 500, "deleted template should fail")
+            _, s4 = cache_stats()
+            check(s4[0] == 0, "deleted template should be evicted")
+        finally:
+            if os.path.exists(cache_tpl):
+                os.unlink(cache_tpl)
 
         status, headers, body = request("GET", "/escape")
         expected = b"&lt;b&gt;&quot;&amp;&#39;&lt;/b&gt;|<i>raw</i>\n"
@@ -222,6 +327,9 @@ def main():
         status, _, _ = request("GET", "/too-large-response")
         check(status == 500, "oversized response should fail with 500")
 
+        status, _, _ = request("GET", "/render-too-large")
+        check(status == 500, "oversized render should fail with 500")
+
         status, headers, body = request("GET", "/static/assets/app.css")
         check(status == 200 and body == b"body { color: red; }\n",
               "static css failed: " + repr(body))
@@ -229,12 +337,43 @@ def main():
               "static css content type")
         check(headers.get("x-content-type-options") == "nosniff",
               "static nosniff header")
+        check(headers.get("transfer-encoding") == "chunked",
+              "static GET should use chunked encoding")
+        check("content-length" not in headers,
+              "static GET should not send content-length")
+
+        large = b"0123456789abcdef" * 10000
+        large_path = os.path.join(ROOT, "tests", "fixtures", "public",
+                                  "assets", "large.bin")
+        with open(large_path, "wb") as f:
+            f.write(large)
+        try:
+            status, headers, body = request("GET", "/static/assets/large.bin")
+            check(status == 200 and body == large,
+                  "static large transfer failed")
+            check(headers.get("transfer-encoding") == "chunked",
+                  "static large transfer should be chunked")
+        finally:
+            os.unlink(large_path)
 
         status, headers, body = request("HEAD", "/static/assets/app.css")
         check(status == 200 and body == b"",
               "static HEAD failed")
         check(headers.get("content-length") == str(len(b"body { color: red; }\n")),
               "static HEAD content-length")
+        check("transfer-encoding" not in headers,
+              "static HEAD should not be chunked")
+
+        conn = http.client.HTTPConnection(HOST, PORT, timeout=5)
+        conn.request("GET", "/static/assets/app.css")
+        r1 = conn.getresponse()
+        check(r1.status == 200 and r1.read() == b"body { color: red; }\n",
+              "static keepalive first request failed")
+        conn.request("GET", "/health")
+        r2 = conn.getresponse()
+        check(r2.status == 200 and r2.read() == b"ok",
+              "static keepalive follow-up failed")
+        conn.close()
 
         status, _, body = request("GET", "/static/assets/")
         check(status == 200 and body == b"<h1>assets</h1>\n",
@@ -408,17 +547,73 @@ def main():
         proc.wait(timeout=5)
         check(proc.returncode == 0, "server exited with %s" % proc.returncode)
 
-        bad = subprocess.run(
-            [os.path.join(ROOT, "tmg"), os.path.join("tests", "fixtures", "http_bad_config.lua")],
+        pending = subprocess.Popen(
+            [os.path.join(ROOT, "tmg"),
+             os.path.join("tests", "fixtures", "http_pending_shutdown.lua")],
             cwd=ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
         )
-        check(bad.returncode != 0, "invalid config should fail")
-        check("max_body must be >= 0" in bad.stderr,
-              "invalid config error message missing: " + bad.stderr)
+        try:
+            wait_ready(pending, 18084)
+
+            disconnect = socket.create_connection((HOST, 18084), timeout=5)
+            disconnect.sendall(
+                b"GET /big HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            check(len(disconnect.recv(1024)) > 0, "big response did not start")
+            disconnect.close()
+            time.sleep(0.1)
+            status, _, body = request("GET", "/health", port=18084)
+            check(status == 200 and body == b"ok",
+                  "server failed after client disconnect during write")
+
+            response = raw_exchange(
+                b"GET /shutdown-big HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Connection: close\r\n\r\n",
+                18084,
+            )
+            check(b" 200 " in response.split(b"\r\n", 1)[0],
+                  "pending shutdown response failed")
+            check(b"Content-Length: 4194304" in response,
+                  "pending shutdown content length missing")
+            check(response.endswith(b"z" * 1024), "pending shutdown body truncated")
+            pending.wait(timeout=10)
+            check(pending.returncode == 0,
+                  "pending shutdown exit code %s" % pending.returncode)
+        finally:
+            if pending.poll() is None:
+                pending.kill()
+                pending.wait()
+            err = pending.stderr.read()
+            check("ERR:" not in err, "pending shutdown stderr: " + err)
+
+        for case, expected in [
+            ("negative", "max_body must be >= 0"),
+            ("timeout_overflow", "header_timeout is too large"),
+            ("size_type", "max_body must be an integer"),
+            ("fraction", "max_body must be an integer"),
+            ("bad_port", "invalid port"),
+        ]:
+            env = dict(os.environ)
+            env["TMG_BAD_CONFIG"] = case
+            bad = subprocess.run(
+                [os.path.join(ROOT, "tmg"),
+                 os.path.join("tests", "fixtures", "http_bad_config.lua")],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                env=env,
+            )
+            check(bad.returncode != 0, "invalid config should fail: " + case)
+            check(expected in bad.stderr,
+                  "invalid config message missing for %s: %s" % (case, bad.stderr))
 
         print("ok: all HTTP tests passed")
     finally:

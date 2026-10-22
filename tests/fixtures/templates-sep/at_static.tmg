@@ -1,0 +1,2 @@
+@@ local value = "global" @@
+At global: @@ tmg.print(value) @@

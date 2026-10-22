@@ -10,11 +10,11 @@
 
 struct http_res_ud {
     http_conn_t *conn;
-    struct http_res_ud *next;
     unsigned long generation;
 };
 
 static bool response_body_limit(http_conn_t *c, size_t len) {
+    if (c->sending_error) return true;
     size_t max = c->state ? c->state->cfg.max_response : 0;
     return max == 0 || len <= max;
 }
@@ -108,10 +108,11 @@ static int l_res_json(lua_State *L) {
     if (c->ended) return luaL_error(L, "response already sent");
     luaL_checkany(L, 2);
 
+    size_t max_response = c->state ? c->state->cfg.max_response : 0;
     str_t out = str_init(128);
-    if (!http_json_encode(L, 2, &out, 0)) {
+    if (!http_json_encode(L, 2, &out, max_response, HTTP_JSON_DEFAULT_DEPTH)) {
         str_deinit(&out);
-        luaL_error(L, "json: unsupported or too deeply nested value");
+        luaL_error(L, "json: unsupported, too deeply nested, or too large value");
     }
 
     if (!http_header_get(c->res_headers, c->nres_headers, "content-type"))
@@ -204,18 +205,6 @@ static int l_res_render(lua_State *L) {
         }
     }
 
-    lua_getglobal(L, "tmg");
-    if (!lua_istable(L, -1)) {
-        str_deinit(&full);
-        return luaL_error(L, "render: tmg module is not available");
-    }
-    lua_getfield(L, -1, "render_string");
-    lua_remove(L, -2);
-    if (!lua_isfunction(L, -1)) {
-        str_deinit(&full);
-        return luaL_error(L, "render: tmg.render_string is not available");
-    }
-
     bool autoescape = true;
     if (lua_istable(L, 4)) {
         lua_getfield(L, 4, "autoescape");
@@ -231,28 +220,29 @@ static int l_res_render(lua_State *L) {
         autoescape = lua_toboolean(L, 4) != 0;
     }
 
-    lua_pushlstring(L, full.data, full.len);
-    lua_pushnil(L); /* default delimiter */
-    if (lua_isnoneornil(L, 3)) lua_pushnil(L);
-    else lua_pushvalue(L, 3);
-    lua_createtable(L, 0, 1);
-    lua_pushboolean(L, autoescape);
-    lua_setfield(L, -2, "autoescape");
+    bool debug = false;
+    lua_getglobal(L, "tmg_debug");
+    if (lua_toboolean(L, -1)) debug = true;
+    lua_pop(L, 1);
 
-    if (lua_pcall(L, 4, 2, 0) != LUA_OK) {
-        const char *err = lua_tostring(L, -1);
+    int data_idx = lua_isnoneornil(L, 3) ? 0 : 3;
+    size_t max_output = c->state ? c->state->cfg.max_response : 0;
+    str_t err = str_init(64);
+    bool ok = tmg_render_cached(L,
+                                c->state ? c->state->template_cache : NULL,
+                                full.data, NULL, debug, data_idx, autoescape,
+                                max_output, &err);
+    if (!ok) {
+        lua_pushlstring(L, err.data ? err.data : "failed", err.len);
+        str_deinit(&err);
         str_deinit(&full);
-        return luaL_error(L, "render: %s", err ? err : "failed");
+        return luaL_error(L, "render: %s", lua_tostring(L, -1));
     }
+    str_deinit(&err);
     str_deinit(&full);
 
-    if (lua_isnil(L, -2)) {
-        const char *err = lua_tostring(L, -1);
-        return luaL_error(L, "render: %s", err ? err : "failed");
-    }
-
     size_t len = 0;
-    const char *body = lua_tolstring(L, -2, &len);
+    const char *body = lua_tolstring(L, -1, &len);
     if (!body) body = "";
     if (!response_body_limit(c, len))
         return luaL_error(L, "response exceeds max_response");
@@ -286,6 +276,13 @@ static const luaL_Reg res_methods[] = {
     {NULL, NULL}
 };
 
+static int l_res_gc(lua_State *L) {
+    http_res_ud_t *r = (http_res_ud_t *)luaL_checkudata(L, 1, HTTP_RES_MT);
+    r->conn = NULL;
+    r->generation = 0;
+    return 0;
+}
+
 static void ensure_res_metatable(lua_State *L) {
     if (luaL_newmetatable(L, HTTP_RES_MT)) {
         lua_newtable(L);
@@ -294,6 +291,8 @@ static void ensure_res_metatable(lua_State *L) {
             lua_setfield(L, -2, r->name);
         }
         lua_setfield(L, -2, "__index");
+        lua_pushcfunction(L, l_res_gc);
+        lua_setfield(L, -2, "__gc");
     }
     lua_pop(L, 1);
 }
@@ -303,24 +302,41 @@ int http_response_push(lua_State *L, http_conn_t *c) {
     http_res_ud_t *r = (http_res_ud_t *)lua_newuserdata(L, sizeof(http_res_ud_t));
     r->conn = c;
     r->generation = c ? c->req_generation : 0;
-    r->next = c ? c->responses : NULL;
-    if (c) c->responses = r;
     luaL_getmetatable(L, HTTP_RES_MT);
     lua_setmetatable(L, -2);
+
+    if (c) {
+        if (c->nres_refs >= c->cres_refs) {
+            size_t nc = c->cres_refs ? c->cres_refs * 2 : 8;
+            c->res_refs = http_realloc(c->res_refs, sizeof(int) * nc);
+            c->cres_refs = nc;
+        }
+        lua_pushvalue(L, -1);
+        c->res_refs[c->nres_refs++] = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
     return 1;
 }
 
 void http_response_detach_all(http_conn_t *c) {
     if (!c) return;
-    http_res_ud_t *r = c->responses;
-    while (r) {
-        http_res_ud_t *next = r->next;
-        r->conn = NULL;
-        r->generation = 0;
-        r->next = NULL;
-        r = next;
+    lua_State *L = c->state ? c->state->L : NULL;
+    for (size_t i = 0; i < c->nres_refs; i++) {
+        int ref = c->res_refs[i];
+        if (L && ref != LUA_NOREF && ref != LUA_REFNIL) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+            http_res_ud_t *r = (http_res_ud_t *)lua_touserdata(L, -1);
+            if (r) {
+                r->conn = NULL;
+                r->generation = 0;
+            }
+            lua_pop(L, 1);
+            luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        }
     }
-    c->responses = NULL;
+    free(c->res_refs);
+    c->res_refs = NULL;
+    c->nres_refs = 0;
+    c->cres_refs = 0;
 }
 
 void http_response_reset(http_conn_t *c) {
@@ -330,9 +346,106 @@ void http_response_reset(http_conn_t *c) {
     c->nres_headers = 0;
     c->cres_headers = 0;
     str_clear(&c->res_body);
+    c->res_content_length = 0;
+    c->res_content_length_set = false;
     c->status = 200;
     c->ended = false;
     c->close_after_write = false;
+}
+
+static void build_response_head(http_conn_t *c, str_t *out, bool chunked,
+                                bool include_content_length,
+                                size_t content_length) {
+    int status = c->status ? c->status : 200;
+    char line[128];
+    snprintf(line, sizeof(line), "HTTP/1.1 %d %s\r\n", status,
+             http_status_reason(status));
+    str_push(out, line);
+
+    char date[64];
+    http_date_now(date, sizeof(date));
+    if (!http_header_get(c->res_headers, c->nres_headers, "date")) {
+        str_push(out, "Date: ");
+        str_push(out, date);
+        str_push(out, "\r\n");
+    }
+    if (!http_header_get(c->res_headers, c->nres_headers, "server")) {
+        str_push(out, "Server: " HTTP_SERVER_NAME "\r\n");
+    }
+
+    for (size_t i = 0; i < c->nres_headers; i++) {
+        const char *n = c->res_headers[i].name;
+        if (strcasecmp(n, "content-length") == 0 ||
+            strcasecmp(n, "transfer-encoding") == 0 ||
+            strcasecmp(n, "connection") == 0)
+            continue;
+        str_push(out, n);
+        str_push(out, ": ");
+        str_push(out, c->res_headers[i].value);
+        str_push(out, "\r\n");
+    }
+
+    if (chunked) {
+        str_push(out, "Transfer-Encoding: chunked\r\n");
+    } else if (include_content_length) {
+        snprintf(line, sizeof(line), "Content-Length: %zu\r\n", content_length);
+        str_push(out, line);
+    }
+
+    bool close = c->close_after_write || !c->keep_alive;
+    str_push(out, close ? "Connection: close\r\n"
+                        : "Connection: keep-alive\r\n");
+    str_push(out, "\r\n");
+}
+
+void http_conn_write_cleanup(http_conn_t *c) {
+    if (!c) return;
+    free(c->write_buf);
+    c->write_buf = NULL;
+    c->write_len = 0;
+    c->writing = false;
+    http_conn_timer_set(c, HTTP_TIMER_NONE, 0);
+}
+
+bool http_conn_write_release(http_conn_t *c) {
+    if (!c) return false;
+    if (!c->closing) return true;
+    if (c->write_close_ref) {
+        c->write_close_ref = false;
+        http_conn_release_ref(c);
+    }
+    return false;
+}
+
+bool http_conn_write_raw(http_conn_t *c, char *buf, size_t len,
+                         uv_write_cb cb) {
+    if (!c || c->closing || c->writing || !buf) {
+        free(buf);
+        return false;
+    }
+    if (len > UINT_MAX) {
+        free(buf);
+        return false;
+    }
+
+    c->write_buf = buf;
+    c->write_len = len;
+    c->writing = true;
+    c->write_req.data = c;
+    http_conn_timer_set(c, HTTP_TIMER_WRITE, c->state->cfg.write_timeout);
+
+    uv_buf_t b = uv_buf_init(buf, (unsigned int)len);
+    int rc = uv_write(&c->write_req, (uv_stream_t *)&c->handle, &b, 1, cb);
+    if (rc != 0) {
+        http_log("uv_write failed: %s", uv_strerror(rc));
+        free(c->write_buf);
+        c->write_buf = NULL;
+        c->write_len = 0;
+        c->writing = false;
+        http_conn_timer_set(c, HTTP_TIMER_NONE, 0);
+        return false;
+    }
+    return true;
 }
 
 bool http_conn_send_response(http_conn_t *c) {
@@ -351,43 +464,15 @@ bool http_conn_send_response(http_conn_t *c) {
         return false;
     }
 
-    str_t out = str_init(512 + c->res_body.len);
-    char line[128];
-    snprintf(line, sizeof(line), "HTTP/1.1 %d %s\r\n", status,
-             http_status_reason(status));
-    str_push(&out, line);
-
-    char date[64];
-    http_date_now(date, sizeof(date));
-    if (!http_header_get(c->res_headers, c->nres_headers, "date")) {
-        str_push(&out, "Date: ");
-        str_push(&out, date);
-        str_push(&out, "\r\n");
-    }
-    if (!http_header_get(c->res_headers, c->nres_headers, "server")) {
-        str_push(&out, "Server: " HTTP_SERVER_NAME "\r\n");
+    size_t content_length = c->res_content_length_set
+        ? c->res_content_length : c->res_body.len;
+    if (c->res_content_length_set && !response_body_limit(c, content_length)) {
+        http_conn_send_error(c, 500, "response exceeds max_response");
+        return false;
     }
 
-    for (size_t i = 0; i < c->nres_headers; i++) {
-        const char *n = c->res_headers[i].name;
-        if (strcasecmp(n, "content-length") == 0 ||
-            strcasecmp(n, "transfer-encoding") == 0 ||
-            strcasecmp(n, "connection") == 0)
-            continue;
-        str_push(&out, n);
-        str_push(&out, ": ");
-        str_push(&out, c->res_headers[i].value);
-        str_push(&out, "\r\n");
-    }
-
-    if (!no_body) {
-        snprintf(line, sizeof(line), "Content-Length: %zu\r\n", c->res_body.len);
-        str_push(&out, line);
-    }
-
-    bool close = c->close_after_write || !c->keep_alive;
-    str_push(&out, close ? "Connection: close\r\n" : "Connection: keep-alive\r\n");
-    str_push(&out, "\r\n");
+    str_t out = str_init(512);
+    build_response_head(c, &out, false, !no_body, content_length);
 
     if (!no_body && !head)
         str_push_len(&out, c->res_body.data ? c->res_body.data : "",
@@ -398,27 +483,28 @@ bool http_conn_send_response(http_conn_t *c) {
         return false;
     }
 
-    c->write_buf = out.data;
-    c->write_len = out.len;
-    c->writing = true;
-    c->write_req.data = c;
-    http_conn_timer_set(c, HTTP_TIMER_WRITE, c->state->cfg.write_timeout);
-
-    if (c->write_len > UINT_MAX) {
-        free(c->write_buf);
-        c->write_buf = NULL;
-        c->writing = false;
+    if (out.len > UINT_MAX) {
+        str_deinit(&out);
         http_conn_send_error(c, 500, "response too large");
         return false;
     }
-    uv_buf_t buf = uv_buf_init(c->write_buf, (unsigned int)c->write_len);
-    int rc = uv_write(&c->write_req, (uv_stream_t *)&c->handle, &buf, 1,
-                      http_conn_write_cb);
-    if (rc != 0) {
-        http_log("uv_write failed: %s", uv_strerror(rc));
-        free(c->write_buf);
-        c->write_buf = NULL;
-        c->writing = false;
+
+    if (!http_conn_write_raw(c, out.data, out.len, http_conn_write_cb)) {
+        http_conn_close(c);
+        return false;
+    }
+    return true;
+}
+
+bool http_conn_send_stream_head(http_conn_t *c, uv_write_cb cb) {
+    if (!c || c->closing || c->writing) return false;
+    str_t out = str_init(512);
+    build_response_head(c, &out, true, false, 0);
+    if (out.len > UINT_MAX) {
+        str_deinit(&out);
+        return false;
+    }
+    if (!http_conn_write_raw(c, out.data, out.len, cb)) {
         http_conn_close(c);
         return false;
     }
@@ -427,6 +513,11 @@ bool http_conn_send_response(http_conn_t *c) {
 
 void http_conn_send_error(http_conn_t *c, int status, const char *msg) {
     if (!c || c->closing) return;
+    if (c->sending_error) {
+        http_conn_close(c);
+        return;
+    }
+    c->sending_error = true;
     if (c->reading) {
         uv_read_stop((uv_stream_t *)&c->handle);
         c->reading = false;
@@ -443,4 +534,5 @@ void http_conn_send_error(http_conn_t *c, int status, const char *msg) {
     str_push(&c->res_body, body);
     c->ended = true;
     http_conn_send_response(c);
+    c->sending_error = false;
 }

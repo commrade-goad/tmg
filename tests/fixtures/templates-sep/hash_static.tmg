@@ -1,0 +1,2 @@
+# local value = "explicit" #
+Hash explicit: # tmg.print(value) #

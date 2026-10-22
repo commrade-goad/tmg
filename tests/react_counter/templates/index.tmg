@@ -1,0 +1,23 @@
+% local count = ... %
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TMG Counter</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+  <main class="counter">
+    <p class="eyebrow">TMG + htmx</p>
+    <h1>Counter</h1>
+    <button class="increment"
+            hx-post="/counter/increment"
+            hx-target="#count"
+            hx-swap="innerHTML">
+      count is <span id="count">% tmg.print(count) %</span>
+    </button>
+  </main>
+</body>
+</html>
