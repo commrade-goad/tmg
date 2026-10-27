@@ -330,6 +330,25 @@ def main():
         status, _, _ = request("GET", "/render-too-large")
         check(status == 500, "oversized render should fail with 500")
 
+        # Regression: a multi-write (chunked static) response on a reused
+        # keep-alive connection must not stall ~40 ms on Nagle + delayed ACK.
+        ka = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+        try:
+            worst = 0.0
+            for _ in range(6):
+                t0 = time.perf_counter()
+                ka.sendall(b"GET /static/assets/app.css HTTP/1.1\r\nHost: x\r\n\r\n")
+                buf = b""
+                while not buf.endswith(b"0\r\n\r\n"):
+                    chunk = ka.recv(65536)
+                    check(chunk, "keep-alive static: connection closed early")
+                    buf += chunk
+                worst = max(worst, time.perf_counter() - t0)
+            check(worst < 0.030,
+                  "keep-alive static latency %.1f ms (TCP_NODELAY missing?)" % (worst * 1000))
+        finally:
+            ka.close()
+
         status, headers, body = request("GET", "/static/assets/app.css")
         check(status == 200 and body == b"body { color: red; }\n",
               "static css failed: " + repr(body))

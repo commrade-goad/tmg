@@ -493,6 +493,10 @@ static void on_new_connection(uv_stream_t *server, int status) {
         http_conn_close(c);
         return;
     }
+    /* Responses (headers, then body/chunks) are written separately. Without
+     * TCP_NODELAY, Nagle + the peer's delayed ACK stall every later write on
+     * a keep-alive connection by ~40 ms. Best effort: ignore failure. */
+    uv_tcp_nodelay((uv_tcp_t *)&c->handle, 1);
 
     c->next = st->conns;
     st->conns = c;
